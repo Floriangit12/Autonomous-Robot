@@ -44,3 +44,9 @@ From carla software simulation environment :
   <img title="Robot architecture" src="Ai Model Architecture/Robot_Architecture.png">
   <figcaption>Robot architecture </figcaption>
 </figure>
+
+
+
+### how to create Map 
+Follow the link : 
+https://carla.readthedocs.io/en/latest/build_windows/#windows-build
