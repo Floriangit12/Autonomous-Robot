@@ -1,5 +1,8 @@
 # Create our autonomous robot
 
+Le code s'appuis sur des models déja utiliser.
+Plusieurs phase dans la réalisation de ce projet.
+
 ## specifications
 
 * Robot operating only on a pedestrian lane and cycle path
@@ -10,6 +13,21 @@
   * Road lane
   * Human and object collision
   * Sheet collision (on the road)
+
+Le projet ce découpe en plusieurs phases de conceptions.
+La deuxieme phase est la plus complexe a mettre en oeuvre et détermine a suite des phases suivante.
+
+### Première phase
+
+  Perception de l'environnement (profondeur de carte, segmentation des textures, détection des objects ,suiveur de ligne)
+  
+### Deuxième phase
+
+Création de la vue 3D bird'eye view (BEV) avec une vue simplifiée sous forme de vecteur.
+
+### Troisième phase
+
+  La sortie du BEV passe dans l'entrée d'un transformer et aussi les différents capteurs GPS et pathway de google map. Cela permet de faire une prediction du les points de route future.
 
 ### Create our ai model
 

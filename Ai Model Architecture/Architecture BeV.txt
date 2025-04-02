@@ -1,0 +1,126 @@
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from torchvision.models.segmentation import deeplabv3_resnet101
+
+class SharedBackbone(nn.Module):
+    def __init__(self, backbone_name='resnet50', pretrained=True):
+        super(SharedBackbone, self).__init__()
+        self.backbone = getattr(models, backbone_name)(pretrained=pretrained)
+        self.features = nn.Sequential(*list(self.backbone.children())[:-2]) # Jusqu'à l'avant-dernière couche
+
+    def forward(self, x):
+        return self.features(x)
+
+class DepthHead(nn.Module):
+    def __init__(self, in_channels, output_resolution=(256, 512)):
+        super(DepthHead, self).__init__()
+        self.output_resolution = output_resolution
+        self.conv1 = nn.Conv2d(in_channels, 256, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(256, 128, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(128, 1, kernel_size=1)
+        self.upsample = nn.Upsample(scale_factor=output_resolution[0] / 32, mode='bilinear', align_corners=False) # Assumes backbone reduces by 32
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.conv3(x)
+        x = self.upsample(x)
+        return x
+
+class SemanticSegmentationHead(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super(SemanticSegmentationHead, self).__init__()
+        self.deeplab = deeplabv3_resnet101(pretrained=True, num_classes=num_classes, aux_loss=None)
+        # Remplacer la première couche conv1 si le backbone partagé a une sortie différente
+        if in_channels != 64: # Output channels of ResNet's first conv layer
+            self.deeplab.backbone.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+    def forward(self, x):
+        output = self.deeplab(x)['out']
+        return output
+
+class BEVFusion(nn.Module):
+    def __init__(self, num_channels_in):
+        super(BEVFusion, self).__init__()
+        self.conv1 = nn.Conv2d(num_channels_in, 128, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
+
+    def forward(self, bev_grid):
+        x = self.relu(self.conv1(bev_grid))
+        return self.conv2(x)
+
+class BEVOutput(nn.Module):
+    def __init__(self, num_bev_features):
+        super(BEVOutput, self).__init__()
+        self.conv_occupancy = nn.Conv2d(num_bev_features, 1, kernel_size=1) # Probabilité d'occupation
+        # Ajouter d'autres couches de sortie pour les vecteurs BeV si nécessaire
+
+    def forward(self, x):
+        occupancy_map = torch.sigmoid(self.conv_occupancy(x))
+        return occupancy_map
+
+class MultiTaskBEVModel(nn.Module):
+    def __init__(self, num_cameras=2, backbone_name='resnet50',
+                 depth_output_resolution=(256, 512), num_semantic_classes=20): # Ajuster le nombre de classes
+        super(MultiTaskBEVModel, self).__init__()
+        self.num_cameras = num_cameras
+        self.backbone = SharedBackbone(backbone_name=backbone_name)
+        backbone_out_channels = self.backbone.features[-1].out_channels
+
+        self.depth_heads = nn.ModuleList([DepthHead(backbone_out_channels, output_resolution=depth_output_resolution) for _ in range(num_cameras)])
+        self.segmentation_heads = nn.ModuleList([SemanticSegmentationHead(backbone_out_channels, num_semantic_classes) for _ in range(num_cameras)])
+        # self.detection_heads = ...
+        # self.traffic_light_heads = ...
+
+        self.bev_fusion = BEVFusion(num_cameras * /* Nombre de caractéristiques projetées */)
+        self.bev_output = BEVOutput(64)
+
+    def forward(self, camera_images, camera_intrinsics, camera_extrinsics):
+        batch_size = camera_images.size(0)
+        shared_features = [self.backbone(camera_images[:, i]) for i in range(self.num_cameras)]
+
+        depth_maps = [self.depth_heads[i](shared_features[i]) for i in range(self.num_cameras)]
+        segmentation_maps = [self.segmentation_heads[i](shared_features[i]) for i in range(self.num_cameras)]
+        # detections = [...]
+        # traffic_light_states = [...]
+
+        # --- Projection vers Pseudo-Lidar et Fusion BeV (Implémentation complexe ici) ---
+        # Cette partie nécessiterait une logique détaillée pour utiliser les cartes de profondeur,
+        # les segmentations, les matrices de caméra et projeter les informations dans la grille BeV.
+        # Il faudrait décider comment représenter les informations de profondeur et de segmentation
+        # dans la grille BeV (par exemple, des canaux supplémentaires pour la profondeur moyenne
+        # et la classe sémantique majoritaire par cellule).
+
+        bev_grid = None # Placeholder pour la grille BeV après projection et agrégation
+
+        if bev_grid is not None:
+            fused_bev_features = self.bev_fusion(bev_grid)
+            bev_representation = self.bev_output(fused_bev_features)
+            return bev_representation, depth_maps, segmentation_maps #, detections, traffic_light_states
+        else:
+            return None, depth_maps, segmentation_maps
+
+# --- Exemple d'instanciation ---
+num_cameras = 2
+depth_output_resolution = (256, 512)
+num_semantic_classes = 20 # Définir le nombre de classes sémantiques pertinentes
+
+model = MultiTaskBEVModel(num_cameras=num_cameras, depth_output_resolution=depth_output_resolution,
+                            num_semantic_classes=num_semantic_classes)
+print(model)
+
+# --- Exemple d'entrée (factice) ---
+batch_size = 1
+camera_images = torch.randn(batch_size, num_cameras, 3, 256, 512) # Assumer une taille d'entrée pour le backbone
+camera_intrinsics = torch.randn(batch_size, num_cameras, 3, 3)
+camera_extrinsics = torch.randn(batch_size, num_cameras, 4, 4)
+
+# --- Passage des données à travers le modèle ---
+output_bev, output_depth, output_segmentation = model(camera_images, camera_intrinsics, camera_extrinsics)
+
+print("\nShape de la sortie BeV (occupation):", output_bev.shape)
+print("Shape des cartes de profondeur (par caméra):", [d.shape for d in output_depth])
+print("Shape des cartes de segmentation (par caméra):", [s.shape for s in output_segmentation])

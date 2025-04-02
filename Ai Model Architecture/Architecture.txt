@@ -1,0 +1,219 @@
+
+
+
+proto code :
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import regnet_y_16gf  # exemple de RegNet depuis torchvision
+
+######################################################
+# 1. BiFPN (exemple simplifié)
+######################################################
+class BiFPN(nn.Module):
+    """
+    Fusionne des features multi-échelles en entrée pour produire
+    un ensemble de features fusionnées à plusieurs niveaux.
+    """
+    def __init__(self, in_channels_list, out_channels=256, num_layers=2):
+        """
+        in_channels_list : liste contenant le nombre de canaux
+                           pour chaque niveau de feature.
+        out_channels : nombre de canaux de sortie pour chaque niveau.
+        num_layers : nombre de couches de fusion BiFPN.
+        """
+        super(BiFPN, self).__init__()
+        # Pour simplifier, on fait un bloc "conv 1x1" par niveau pour
+        # ramener tout le monde à out_channels.
+        self.convs = nn.ModuleList([
+            nn.Conv2d(in_ch, out_channels, kernel_size=1)
+            for in_ch in in_channels_list
+        ])
+        
+        # On répète un même "bloc" de fusion n fois
+        self.num_layers = num_layers
+        self.fusion_weights = nn.ParameterList([
+            nn.Parameter(torch.ones(len(in_channels_list), dtype=torch.float32))
+            for _ in range(num_layers)
+        ])
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, features):
+        """
+        features : liste de tenseurs [f0, f1, f2, ...]
+                   où f0 est la plus haute résolution et fN la plus basse.
+        """
+        # 1) Ramener tous les features à out_channels
+        feats = []
+        for i, conv in enumerate(self.convs):
+            feats.append(conv(features[i]))
+        
+        # 2) Fusion ascendante/descendante simplifiée
+        for l in range(self.num_layers):
+            w = self.fusion_weights[l]
+            w = self.relu(w)
+            norm = torch.sum(w, dim=0) + 1e-4
+            
+            # Ex. On fait un "top-down" pass (très simplifié)
+            for i in reversed(range(len(feats)-1)):
+                feats[i] = (w[i]*feats[i] + w[i+1]*F.interpolate(feats[i+1], scale_factor=2, mode='nearest')) / norm
+            
+            # Ex. On fait un "bottom-up" pass
+            for i in range(1, len(feats)):
+                feats[i] = (w[i]*feats[i] + w[i-1]*F.max_pool2d(feats[i-1], kernel_size=2)) / norm
+        
+        return feats  # liste de features fusionnées multi-résolution
+
+######################################################
+# 2. Têtes spécialisées
+######################################################
+
+# 2.1 Object Detection (classification, régression, attributs)
+class ObjectDetectionHead(nn.Module):
+    def __init__(self, in_channels=256, num_classes=10, num_anchors=9, num_attrs=5):
+        """
+        num_classes : nombre de classes d'objets
+        num_anchors : nombre d'ancres par emplacement
+        num_attrs   : nombre d'attributs à prédire (ex: orientation, etc.)
+        """
+        super(ObjectDetectionHead, self).__init__()
+        # On peut définir un petit réseau (ex: conv + conv 1x1) pour classification & regression
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        # Sortie = (4 coords + 1 objectness + num_classes + num_attrs) * num_anchors
+        self.pred = nn.Conv2d(in_channels, num_anchors*(4 + 1 + num_classes + num_attrs), kernel_size=1)
+    
+    def forward(self, x):
+        """
+        x : feature map [B, in_channels, H, W]
+        """
+        x = F.relu(self.conv(x))
+        out = self.pred(x)  # [B, A*(4+1+num_classes+num_attrs), H, W]
+        return out
+
+# 2.2 Traffic Lights (classification + attributs, ex: couleur, état)
+class TrafficLightHead(nn.Module):
+    def __init__(self, in_channels=256, num_states=4, num_attrs=2):
+        """
+        num_states : ex: rouge, vert, jaune, off
+        num_attrs  : ex: clignotant / stable, intensité...
+        """
+        super(TrafficLightHead, self).__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels//2, kernel_size=3, padding=1)
+        self.classifier = nn.Conv2d(in_channels//2, num_states, kernel_size=1)
+        self.attr_pred = nn.Conv2d(in_channels//2, num_attrs, kernel_size=1)
+    
+    def forward(self, x):
+        x = F.relu(self.conv(x))
+        class_logits = self.classifier(x)  # [B, num_states, H, W] (ou H=1, W=1 si global)
+        attr_out = self.attr_pred(x)       # [B, num_attrs, H, W]
+        return class_logits, attr_out
+
+# 2.3 Lane Prediction (ex: régression de polynômes ou couloirs)
+class LanePredictionHead(nn.Module):
+    def __init__(self, in_channels=256, output_dim=8):
+        """
+        output_dim : dimension de la sortie (ex: coefficients polynomiaux,
+                     ou points clés, etc.)
+        """
+        super(LanePredictionHead, self).__init__()
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(in_channels, output_dim)
+    
+    def forward(self, x):
+        """
+        x : [B, in_channels, H, W]
+        """
+        # On agrège l'info globalement
+        x = self.pool(x)        # [B, in_channels, 1, 1]
+        x = x.view(x.size(0), -1)
+        out = self.fc(x)        # [B, output_dim]
+        return out
+
+######################################################
+# 3. Modèle principal HydraNet
+######################################################
+class TeslaHydraNet(nn.Module):
+    def __init__(self):
+        super(TeslaHydraNet, self).__init__()
+        
+        # --- 1) Backbone RegNet (ex: regnet_y_16gf) ---
+        # On le charge depuis torchvision, en retirant la dernière couche FC
+        backbone_full = regnet_y_16gf(weights=None)  # ou weights=...
+        # On récupère les blocs pour extraire des features multi-échelles
+        # Selon la version de torchvision, on peut accéder aux "trunk_output" ou "features".
+        # Ici, on va illustrer en scindant manuellement.
+        self.stem = backbone_full.stem  # conv initial
+        self.trunk_output = nn.ModuleList([
+            backbone_full.trunk_output.block1,
+            backbone_full.trunk_output.block2,
+            backbone_full.trunk_output.block3,
+            backbone_full.trunk_output.block4,
+        ])
+        # Nombre de canaux à chaque niveau
+        # (selon regnet_y_16gf, c'est un exemple, vous pouvez l'ajuster)
+        self.channels_per_level = [64, 128, 384, 888]  # variable selon la config
+
+        # --- 2) BiFPN pour fusion multi-scale ---
+        self.bifpn = BiFPN(
+            in_channels_list=self.channels_per_level,
+            out_channels=256,
+            num_layers=2
+        )
+
+        # --- 3) Têtes multi-tâches ---
+        self.det_head = ObjectDetectionHead(in_channels=256, num_classes=10, num_attrs=5)
+        self.tl_head = TrafficLightHead(in_channels=256, num_states=4, num_attrs=2)
+        self.lane_head = LanePredictionHead(in_channels=256, output_dim=8)
+
+    def forward(self, x):
+        """
+        x : image [B, 3, H, W]
+        """
+        # 1) Passer dans la stem
+        x = self.stem(x)  # [B, stem_channels, H/2, W/2] environ
+        
+        # 2) Récupérer plusieurs niveaux de features
+        features = []
+        out = x
+        for i, block in enumerate(self.trunk_output):
+            out = block(out)
+            features.append(out)  # On accumule les features de chaque niveau
+        
+        # 3) Passer dans le BiFPN
+        fused_feats = self.bifpn(features)  
+        # fused_feats est une liste de tenseurs (multi-résolutions),
+        # ex: [f0, f1, f2, f3], tous en 256 canaux, de résolutions différentes.
+
+        # 4) On peut choisir un certain niveau (ex. le dernier) pour chaque tête
+        #    ou combiner plusieurs niveaux. Ici, on prend seulement le plus profond
+        #    pour simplifier (fused_feats[-1]).
+        highest_feat = fused_feats[-1]  # ex: [B, 256, H/16, W/16]
+
+        # Tête de détection : on pourrait aussi utiliser d'autres niveaux (FPN style)
+        det_out = self.det_head(highest_feat)
+
+        # Tête traffic light : classification + attributs
+        tl_class, tl_attr = self.tl_head(highest_feat)
+
+        # Tête lane prediction : régression globale
+        lane_out = self.lane_head(highest_feat)
+
+        return {
+            "object_detection": det_out,   # [B, A*(4+1+num_classes+attrs), H/16, W/16]
+            "traffic_light_cls": tl_class, # [B, num_states, H/16, W/16]
+            "traffic_light_attr": tl_attr, # [B, num_attrs, H/16, W/16]
+            "lane_prediction": lane_out    # [B, output_dim]
+        }
+
+######################################################
+# 4. Test du modèle
+######################################################
+if __name__ == "__main__":
+    # Exemple : entrée 640x640
+    x = torch.randn(1, 3, 640, 640)
+    model = TeslaHydraNet()
+    outputs = model(x)
+    for k, v in outputs.items():
+        print(k, v.shape if isinstance(v, torch.Tensor) else [t.shape for t in v] )
