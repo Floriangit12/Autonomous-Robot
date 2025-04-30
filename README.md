@@ -65,6 +65,14 @@ From carla software simulation environment :
 
 
 
-### how to create Map 
-Follow the link : 
+### how to create Map
+Follow the link:
+Tesla model explaine:
+
+méthode 4 Pillars : https://www.thinkautonomous.ai/blog/autonomous-vehicle-architecture/
+[ Perception -> Localization -> Planning -> Control ]
+this methode is very good for only for little system
+
+https://www.thinkautonomous.ai/blog/tesla-end-to-end-deep-learning/
+https://www.thinkautonomous.ai/blog/occupancy-networks/?ref=thinkautonomous.ai
 https://carla.readthedocs.io/en/latest/build_windows/#windows-build
