@@ -63,9 +63,12 @@ From carla software simulation environment :
   <figcaption>Robot architecture </figcaption>
 </figure>
 
+Dataset used :
 
+Création de map custom pour établir un dataset le plus réaliste possible
 
 ### how to create Map
+
 Follow the link:
 Tesla model explaine:
 
