@@ -1,0 +1,11 @@
+je veux faire un robot de dimension 30cm de haut et 30cm de coté. Il doit etre autonome dans ca conduite.
+Le robot doit se déplacer sur les chemins piétons et ou vélo. Pour cela, on doit trouver une solution pour qu'il se déplace et détecte les panneaux feux tricolors etc. Il doit prédire les points sur qlq metre mais il connait la destinttion avec la map google map de google.
+Hardware : 4 cameras RGB sur chaque coté, GPS, accelerometre etc mais pas de lidar. Une carte puissante pour faire tourner les model ia sans limite (fonction du model choisie)
+Le but est que tu trouve une bonne architecture avec les bons paramètres d'un model.
+Architecture que j'ai pensé est : 
+un regnet avec BiFPN et multi-scale avec différentes tetes : ségmentation semantique, depth map et autre a toi de me dire, cela pour chaque caméra
+
+Puis un vision transformer qui réalise la 3d occupancy (donne les dimension de la représentation 3d)
+Puis avec cette représentation 3d, par des models ia déjà fait comme A*, je peux coder la ou le robot peut et ne peut pas se déplacer etc
+
+Dis moi si cela est bien comme architecture et donne moi des recommandation 
