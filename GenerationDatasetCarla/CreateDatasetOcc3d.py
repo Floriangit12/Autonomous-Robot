@@ -13,7 +13,7 @@ Dataset d'occupancy implicite pour un MLP "à la Tesla" à partir de CARLA :
     * on génère des points EMPTY le long du rayon (avant le hit)
     * on transforme hits + empty en repère robot et on accumule
 - À la fin de la frame :
-    * on voxelise la zone [-16,16] x [-16,16] x [-8,8] en cubes de 0.5 m
+    * on voxelise la zone [-16,16] x [-16,16] x [-2,4] en cubes de 0.5 m
     * voxels avec hits -> Occupied, label sémantique (Building / Road / Vehicle, etc.)
     * voxels avec uniquement des empty -> classe Empty
     * voxels sans aucune observation -> classe Unknown (occlusion / jamais vus)
@@ -160,7 +160,7 @@ CARLA_22 = [
 class VoxelConfig:
     x_range: Tuple[float, float] = (-16.0, 16.0)
     y_range: Tuple[float, float] = (-16.0, 16.0)
-    z_range: Tuple[float, float] = (-2.0, 8.0)
+    z_range: Tuple[float, float] = (-2.0, 4.0)
     voxel_size: float = 0.5
 
     @property
