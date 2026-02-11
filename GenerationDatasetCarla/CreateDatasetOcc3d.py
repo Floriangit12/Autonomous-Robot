@@ -1020,7 +1020,7 @@ class FastDatasetGenerator:
                 with SectionTimer(self.perf, "apply_world_settings"):
                     settings = self.world.get_settings()
                     settings.synchronous_mode = True
-                    settings.fixed_delta_seconds = 0.05
+                    settings.fixed_delta_seconds = 0.2
                     settings.no_rendering_mode = False
                     self.world.apply_settings(settings)
 
@@ -1131,14 +1131,37 @@ class FastDatasetGenerator:
 
     # ---------- OCCUPANCY IMPLICITE ----------
 
+    import time
+
     def _build_implicit_from_points(
         self,
         pts_robot: np.ndarray,
         lbl_raw: np.ndarray,
         target_total_points: int,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Optimisations appliquées (focus sur tes timings):
+        - EMPTY / UNKNOWN: suppression de la boucle "par voxel" => sampling vectorisé
+            (approximation acceptée: sampling AVEC remise dans chaque voxel, donc pas de replace=False)
+        - OCC: garde la boucle (déjà rapide chez toi) + optimisation choice(replace=True)->integers
+        - OCC label: mapping compressé (pas d'alloc full-grid)
+        - instrumentation temps (perf_counter)
+        """
+        import time
+        import numpy as np
+
         EMPTY_LABEL = 254
         UNKNOWN_LABEL = 253
+
+        def tic():
+            return time.perf_counter()
+
+        def toc(t0, name):
+            dt = time.perf_counter() - t0
+            print(f"[TIME] {name:<22s}: {dt:.4f}s")
+
+        t_global = tic()
+
         if pts_robot is None or pts_robot.shape[0] == 0:
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint8)
 
@@ -1151,7 +1174,8 @@ class FastDatasetGenerator:
         pts_robot = np.asarray(pts_robot, dtype=np.float32)
         lbl_raw = np.asarray(lbl_raw)
 
-        # ROI
+        # ---------------- ROI ----------------
+        t0 = tic()
         x = pts_robot[:, 0]
         y = pts_robot[:, 1]
         z = pts_robot[:, 2]
@@ -1165,8 +1189,10 @@ class FastDatasetGenerator:
 
         pts = pts_robot[mask_in]
         lbl_raw = lbl_raw[mask_in]
+        toc(t0, "ROI filtering")
 
-        # split hit / empty / unknown-ray
+        # ---------------- SPLIT ----------------
+        t0 = tic()
         mask_empty = (lbl_raw == LIDAR_EMPTY_SENTINEL)
         mask_unknown = (lbl_raw == LIDAR_UNKNOWN_SENTINEL)
         mask_hit = ~(mask_empty | mask_unknown)
@@ -1181,10 +1207,9 @@ class FastDatasetGenerator:
             lbl_hits_raw.astype(np.uint8, copy=False)
             if lbl_hits_raw.size else np.zeros((0,), dtype=np.uint8)
         )
+        toc(t0, "split classes")
 
         nx, ny, nz = vx.grid_shape
-        n_voxels = int(nx) * int(ny) * int(nz)
-
         inv_vs = 1.0 / vs
 
         def voxel_flat_ids(p: np.ndarray) -> np.ndarray:
@@ -1198,19 +1223,26 @@ class FastDatasetGenerator:
             np.clip(iz, 0, nz - 1, out=iz)
             return (ix + nx * (iy + ny * iz)).astype(np.int64, copy=False)
 
+        # ---------------- VOXEL IDS ----------------
+        t0 = tic()
         flat_hit = voxel_flat_ids(pts_hits)
         flat_empty = voxel_flat_ids(pts_empty)
         flat_unknown = voxel_flat_ids(pts_unknown_ray)
+        toc(t0, "voxelization")
 
-        # label par voxel OCC = label du 1er hit du voxel (comme avant)
-        voxel_occ_label = np.full((n_voxels,), -1, dtype=np.uint8)
+        # ---------------- OCC LABEL MAP (compressé) ----------------
+        t0 = tic()
+        uniq_hit = np.zeros((0,), dtype=np.int64)
+        hit_labels_per_uniq = np.zeros((0,), dtype=np.uint8)
         if flat_hit.size:
             uniq_hit, first_idx = np.unique(flat_hit, return_index=True)
-            voxel_occ_label[uniq_hit] = lbl_hits_id[first_idx]
+            hit_labels_per_uniq = lbl_hits_id[first_idx]
+        toc(t0, "occ label map")
 
         rng = np.random.default_rng()
 
-        # ===== OCCUPIED (hits réels) =====
+        # ================= OCC (boucle voxel, déjà rapide chez toi) =================
+        t0_occ = tic()
         points_occ = np.zeros((0, 3), dtype=np.float16)
         labels_occ = np.zeros((0,), dtype=np.uint8)
 
@@ -1228,14 +1260,11 @@ class FastDatasetGenerator:
                     dtype=np.int32
                 )
 
-                # ----- PRE-ALLOC avec marge pour upsampling -----
-                # si on ajoute ~1 point par point: facteur 2
                 R = self.occ_upsample_radius
                 p_up = self.occ_upsample_prob
 
                 base_total = int(n_pts_per_vox.sum())
                 if R > 0.0 and p_up > 0.0 and hasattr(self, "_occ_offset_bank"):
-                    # espérance des points ajoutés
                     extra_est = int(np.ceil(base_total * min(max(p_up, 0.0), 1.0)))
                 else:
                     extra_est = 0
@@ -1254,40 +1283,41 @@ class FastDatasetGenerator:
                     n_pts = int(n_pts_per_vox[i])
 
                     idxs = order[s:e]
-                    chosen = rng.choice(idxs, size=n_pts, replace=(c < n_pts))
+
+                    # OPT: replace=True -> integers
+                    if c < n_pts:
+                        chosen = idxs[rng.integers(0, c, size=n_pts, dtype=np.int32)]
+                    else:
+                        chosen = rng.choice(idxs, size=n_pts, replace=False)
 
                     pts_vox = pts_hits[chosen]
-                    lbl_vox = voxel_occ_label[v]
 
-                    # --- write base ---
+                    # label OCC via mapping compressé (uniq_v ⊂ uniq_hit)
+                    pos = np.searchsorted(uniq_hit, v)
+                    lbl_vox = hit_labels_per_uniq[pos] if uniq_hit.size else UNKNOWN_LABEL
+
                     out_pts[write:write + n_pts] = pts_vox
                     out_lbl[write:write + n_pts] = lbl_vox
                     base_slice_start = write
                     write += n_pts
 
-                    # --- inline upsampling OCC ---
+                    # upsample OCC (inchangé fonctionnellement)
                     if extra_est > 0:
-                        # combien de points on ajoute pour ce voxel ?
-                        # option A: 1 point ajouté par point (p_up=1)
-                        # option B: binomial pour en ajouter une fraction (p_up < 1)
                         if p_up >= 1.0:
                             n_add = n_pts
                             add_idx_local = np.arange(n_pts, dtype=np.int32)
                         else:
-                            # tire parmi les n_pts, sans replacement
                             n_add = int(rng.binomial(n_pts, p_up))
                             if n_add <= 0:
                                 continue
                             add_idx_local = rng.choice(n_pts, size=n_add, replace=False)
 
-                        # centres = sous-ensemble des points déjà écrits pour ce voxel
-                        centers = out_pts[base_slice_start:base_slice_start + n_pts][add_idx_local]
+                        base_slice = slice(base_slice_start, base_slice_start + n_pts)
+                        centers = out_pts[base_slice][add_idx_local]
 
-                        # offsets pré-calculés
                         off_idx = rng.integers(0, K, size=n_add, dtype=np.int32)
                         new_pts = centers + self._occ_offset_bank[off_idx]
 
-                        # clip ROI (évite sortir)
                         np.clip(new_pts[:, 0], x_min, x_max, out=new_pts[:, 0])
                         np.clip(new_pts[:, 1], y_min, y_max, out=new_pts[:, 1])
                         np.clip(new_pts[:, 2], z_min, z_max, out=new_pts[:, 2])
@@ -1296,11 +1326,13 @@ class FastDatasetGenerator:
                         out_lbl[write:write + n_add] = lbl_vox
                         write += n_add
 
-                # trim exact
                 points_occ = out_pts[:write]
                 labels_occ = out_lbl[:write]
 
-        # ===== EMPTY (LiDAR uniquement, capé par voxel) =====
+        toc(t0_occ, "OCC loop")
+
+        # ================= EMPTY (vectorisé, approx: AVEC remise par voxel) =================
+        t0_empty = tic()
         points_empty = np.zeros((0, 3), dtype=np.float16)
         labels_empty = np.zeros((0,), dtype=np.uint8)
 
@@ -1309,7 +1341,7 @@ class FastDatasetGenerator:
             flat_e_sorted = flat_empty[order_e]
             uniq_v_e, start_e, count_e = np.unique(flat_e_sorted, return_index=True, return_counts=True)
 
-            n_vox_e = uniq_v_e.size
+            n_vox_e = int(uniq_v_e.size)
             if n_vox_e:
                 n_pts_per_vox_e = rng.integers(
                     self.points_per_voxel_min,
@@ -1317,27 +1349,39 @@ class FastDatasetGenerator:
                     size=n_vox_e,
                     dtype=np.int32
                 )
+
                 total_e = int(n_pts_per_vox_e.sum())
-                out_pts_e = np.empty((total_e, 3), dtype=np.float32)
+                # on écrit directement en float16 pour réduire BW mémoire
+                out_pts_e = np.empty((total_e, 3), dtype=np.float16)
                 out_lbl_e = np.full((total_e,), EMPTY_LABEL, dtype=np.uint8)
 
-                write = 0
-                for i in range(n_vox_e):
-                    s = int(start_e[i])
-                    c = int(count_e[i])
-                    e = s + c
-                    n_pts = int(n_pts_per_vox_e[i])
+                # offsets de sortie (où écrire chaque voxel)
+                out_off = np.empty((n_vox_e + 1,), dtype=np.int64)
+                out_off[0] = 0
+                np.cumsum(n_pts_per_vox_e, out=out_off[1:])
 
-                    idxs = order_e[s:e]
-                    chosen = rng.choice(idxs, size=n_pts, replace=(c < n_pts))
+                # indices de sortie (flat) => quel voxel pour chaque point à générer
+                # voxel_id_per_out[k] = i (index voxel) pour le k-ième point à écrire
+                voxel_id_per_out = np.repeat(np.arange(n_vox_e, dtype=np.int32), n_pts_per_vox_e)
 
-                    out_pts_e[write:write + n_pts] = pts_empty[chosen]
-                    write += n_pts
+                # pour chaque point, on tire un offset local dans [0, count_voxel)
+                counts_rep = count_e[voxel_id_per_out].astype(np.int64, copy=False)
+                local = rng.integers(0, counts_rep, size=total_e, dtype=np.int64)
+
+                # position globale dans l'array trié order_e : pos = start + local
+                pos = start_e[voxel_id_per_out].astype(np.int64, copy=False) + local
+
+                # gather en 1 shot
+                chosen_global = order_e[pos]
+                out_pts_e[:] = pts_empty[chosen_global].astype(np.float16, copy=False)
 
                 points_empty = out_pts_e
                 labels_empty = out_lbl_e
 
-        # ===== UNKNOWN (LiDAR unknown-ray uniquement, capé par voxel) =====
+        toc(t0_empty, "EMPTY loop (vect)")
+
+        # ================= UNKNOWN (vectorisé, approx: AVEC remise par voxel) =================
+        t0_unk = tic()
         points_unknown = np.zeros((0, 3), dtype=np.float16)
         labels_unknown = np.zeros((0,), dtype=np.uint8)
 
@@ -1346,7 +1390,7 @@ class FastDatasetGenerator:
             flat_u_sorted = flat_unknown[order_u]
             uniq_v_u, start_u, count_u = np.unique(flat_u_sorted, return_index=True, return_counts=True)
 
-            n_vox_u = uniq_v_u.size
+            n_vox_u = int(uniq_v_u.size)
             if n_vox_u:
                 n_pts_per_vox_u = rng.integers(
                     self.points_per_voxel_min,
@@ -1354,43 +1398,44 @@ class FastDatasetGenerator:
                     size=n_vox_u,
                     dtype=np.int32
                 )
+
                 total_u = int(n_pts_per_vox_u.sum())
-                out_pts_u = np.empty((total_u, 3), dtype=np.float32)
+                out_pts_u = np.empty((total_u, 3), dtype=np.float16)
                 out_lbl_u = np.full((total_u,), UNKNOWN_LABEL, dtype=np.uint8)
 
-                write = 0
-                for i in range(n_vox_u):
-                    s = int(start_u[i])
-                    c = int(count_u[i])
-                    e = s + c
-                    n_pts = int(n_pts_per_vox_u[i])
+                voxel_id_per_out = np.repeat(np.arange(n_vox_u, dtype=np.int32), n_pts_per_vox_u)
 
-                    idxs = order_u[s:e]
-                    chosen = rng.choice(idxs, size=n_pts, replace=(c < n_pts))
+                counts_rep = count_u[voxel_id_per_out].astype(np.int64, copy=False)
+                local = rng.integers(0, counts_rep, size=total_u, dtype=np.int64)
+                pos = start_u[voxel_id_per_out].astype(np.int64, copy=False) + local
 
-                    out_pts_u[write:write + n_pts] = pts_unknown_ray[chosen]
-                    write += n_pts
+                chosen_global = order_u[pos]
+                out_pts_u[:] = pts_unknown_ray[chosen_global].astype(np.float16, copy=False)
 
                 points_unknown = out_pts_u
                 labels_unknown = out_lbl_u
 
+        toc(t0_unk, "UNKNOWN loop (vect)")
+
         n_occ, n_emp, n_unk = points_occ.shape[0], points_empty.shape[0], points_unknown.shape[0]
         print(f"   → Pools: occ={n_occ} pts, empty={n_emp} pts, unk={n_unk} pts (avant ratios)")
 
-        # si pas de cible : retourne tout
+        # ---------------- ratios / target ----------------
+        t0 = tic()
         if target_total_points <= 0:
             pts_final = np.vstack([points_occ, points_empty, points_unknown]).astype(np.float32, copy=False)
             lbl_final = np.hstack([labels_occ, labels_empty, labels_unknown]).astype(np.uint8, copy=False)
+            toc(t0, "final stack (no target)")
+            toc(t_global, "TOTAL")
             return pts_final, lbl_final
 
-        # quotas
         n_occ_target = int(target_total_points * self.ratio_occ)
         n_emp_target = int(target_total_points * self.ratio_empty)
         n_unk_target = int(target_total_points - n_occ_target - n_emp_target)
 
         def sample_class(pts_c: np.ndarray, lbl_c: np.ndarray, target: int):
             if pts_c.shape[0] == 0 or target <= 0:
-                return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint8)
+                return np.zeros((0, 3), dtype=np.float16), np.zeros((0,), dtype=np.uint8)
             if pts_c.shape[0] <= target:
                 return pts_c, lbl_c
             idx = rng.choice(pts_c.shape[0], size=target, replace=False)
@@ -1403,11 +1448,19 @@ class FastDatasetGenerator:
         pts_final = np.vstack([pts_occ_s, pts_emp_s, pts_unk_s]).astype(np.float16, copy=False)
         lbl_final = np.hstack([lbl_occ_s, lbl_emp_s, lbl_unk_s]).astype(np.uint8, copy=False)
 
-        print(f"   → Points finals (occ/empty/unk): "
-            f"{pts_occ_s.shape[0]}/{pts_emp_s.shape[0]}/{pts_unk_s.shape[0]} "
-            f"(total={pts_final.shape[0]:,} cible={target_total_points:,})")
+        toc(t0, "final sampling+stack")
 
+        print(
+            f"   → Points finals (occ/empty/unk): "
+            f"{pts_occ_s.shape[0]}/{pts_emp_s.shape[0]}/{pts_unk_s.shape[0]} "
+            f"(total={pts_final.shape[0]:,} cible={target_total_points:,})"
+        )
+
+        toc(t_global, "TOTAL")
         return pts_final, lbl_final
+
+
+
 
 
 
@@ -1463,7 +1516,7 @@ class FastDatasetGenerator:
             dtype=object
         )
         class_ids = np.array(
-            [-2, -1] + [int(_id) for (_id, _name, _rgb) in CARLA_22],
+            [254, 253] + [int(_id) for (_id, _name, _rgb) in CARLA_22],
             dtype=np.uint8
         )
         class_colors = np.array(
@@ -1713,13 +1766,13 @@ def main():
     parser.add_argument('--tm-port', type=int, default=8000, help='Port du Traffic Manager')
     parser.add_argument('--seed', type=int, default=42, help='Seed')
 
-    parser.add_argument('--z-min', type=float, default=0.5, help='Hauteur min relative LiDAR (m)')
-    parser.add_argument('--z-max', type=float, default=3, help='Hauteur max relative LiDAR (m)')
+    parser.add_argument('--z-min', type=float, default=0.1, help='Hauteur min relative LiDAR (m)')
+    parser.add_argument('--z-max', type=float, default=4, help='Hauteur max relative LiDAR (m)')
     parser.add_argument('--z-step', type=float, default=4, help='Pas entre LiDARs (m)')
     parser.add_argument('--h-fov', type=float, default=360.0, help='FOV horizontal (deg)')
-    parser.add_argument('--v-upper', type=float, default=40.0, help='FOV vertical haut (deg)')
-    parser.add_argument('--v-lower', type=float, default=-40.0, help='FOV vertical bas (deg)')
-    parser.add_argument('--lidar-channels', type=int, default=256, help='Canaux LiDAR')
+    parser.add_argument('--v-upper', type=float, default=30.0, help='FOV vertical haut (deg)')
+    parser.add_argument('--v-lower', type=float, default=-30.0, help='FOV vertical bas (deg)')
+    parser.add_argument('--lidar-channels', type=int, default=512, help='Canaux LiDAR')
     parser.add_argument('--lidar-pps', type=int, default=500_000, help='Points/seconde LiDAR')
     parser.add_argument('--lidar-range', type=float, default=1000, help='Portée LiDAR (m)')
 
@@ -1730,7 +1783,7 @@ def main():
     parser.add_argument('--weather-id', type=int, default=0,
                         help='0 clear_noon | 1 overcast_morning | ...')
     parser.add_argument('--profile', action='store_true', default=True, help='Activer le profiling')
-    parser.add_argument('--capture-points', type=int, default=800_000,
+    parser.add_argument('--capture-points', type=int, default=2_000_000,
                         help='Quota de points LiDAR à capturer par frame (hits + empty)')
     parser.add_argument('--points-min-saved', type=int, default=55_000,
                         help='Nb min de points occupancy sauvegardés par frame')
@@ -1744,8 +1797,8 @@ def main():
                         help='Bruit angles caméra (pitch/yaw/roll) en % (±)')
 
     # fenêtre ego
-    parser.add_argument('--window-back', type=int, default=1, help='Nombre de poses passées de l’ego à charger')
-    parser.add_argument('--window-forward', type=int, default=1, help='Nombre de poses futures de l’ego à charger')
+    parser.add_argument('--window-back', type=int, default=2, help='Nombre de poses passées de l’ego à charger')
+    parser.add_argument('--window-forward', type=int, default=2, help='Nombre de poses futures de l’ego à charger')
     parser.add_argument('--proximity-radius', type=float, default=0.2,
                         help='Rayon pour détecter piéton/véhicule à T0')
     parser.add_argument('--max-ticks-per-pose', type=int, default=50,
