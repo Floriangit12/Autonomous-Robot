@@ -284,7 +284,7 @@ class WeatherManager:
             rayleigh_scattering_scale=p['rayleigh_scattering_scale'], dust_storm=p['dust_storm']
         )
         self.world.set_weather(weather)
-        for _ in range(2):
+        for _ in range(1):
             self.world.tick()
         # time.sleep(0.1)
         print(f" 🌤️ Météo appliquée (FIXE): [{idx}] {name}")
@@ -334,7 +334,13 @@ class PersistentSensorManager:
         self.window_back = int(window_back)
         self.window_forward = int(window_forward)
         self.lidar_slot_ids = list(range(-self.window_back, self.window_forward + 1))
-
+        self.lidar_rigs: Dict[int, List[carla.Actor]] = {}      # slot -> list[actors]
+        self.lidar_actor_to_slot: Dict[int, int] = {}           # actor_id -> slot
+        self.current_pose_j = None
+        self.window_back = int(window_back)
+        self.window_forward = int(window_forward)
+        self.lidar_slot_ids = list(range(-self.window_back, self.window_forward + 1))
+        self.bank_global_offset_world = (0.0, 0.0, 0.0)
 
         self.params = {
             'z_min': z_min, 'z_max': z_max, 'z_step': z_step,
@@ -393,27 +399,80 @@ class PersistentSensorManager:
             [-sp, cp * sr, cp * cr]
         ], dtype=np.float32)
 
-    def _to_robot_frame(self, pts_local, sensor_transform):
-        # Matrix capteur -> Monde
-        m_sensor_world = np.array(sensor_transform.get_matrix())
-        
-        # Matrix Monde -> Robot T0 (Inverse de la matrice du robot à T0)
-        ref_pos = self.reference_robot_transform or self.current_robot_transform
+    @staticmethod
+    def _T_translate(dx: float, dy: float, dz: float) -> np.ndarray:
+        T = np.eye(4, dtype=np.float32)
+        T[0, 3] = dx
+        T[1, 3] = dy
+        T[2, 3] = dz
+        return T
+    
+    def _to_robot_frame(self, pts_local: np.ndarray, sensor_transform: carla.Transform):
+        if pts_local is None or pts_local.size == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        # sensor -> world
+        M_sw = np.array(sensor_transform.get_matrix(), dtype=np.float32)
+
+        # world -> robot(T0)
+        ref = self.reference_robot_transform
         robot_tf = carla.Transform(
-            carla.Location(**ref_pos['location']),
-            carla.Rotation(**ref_pos['rotation'])
+            carla.Location(**ref["location"]),
+            carla.Rotation(**ref["rotation"])
         )
-        m_world_robot = np.array(robot_tf.get_inverse_matrix())
+        M_wr = np.array(robot_tf.get_inverse_matrix(), dtype=np.float32)
 
-        # On combine les deux pour avoir : Capteur -> Monde -> Robot
-        m_combined = np.dot(m_world_robot, m_sensor_world)
+        # undo global bank offset in WORLD
+        dxo, dyo, dzo = self.bank_global_offset_world
+        M_undo = np.eye(4, dtype=np.float32)
+        M_undo[0, 3] = -dxo
+        M_undo[1, 3] = -dyo
+        M_undo[2, 3] = -dzo
 
-        # Application aux points
-        points_4d = np.ones((pts_local.shape[0], 4))
-        points_4d[:, :3] = pts_local
-        pts_robot = np.dot(m_combined, points_4d.T).T
-        
-        return pts_robot[:, :3].astype(np.float32)
+        # full chain: sensor -> world(true) -> robot(T0)
+        M_sr = M_wr @ M_undo @ M_sw
+
+        # apply with column-vector convention using transpose trick
+        pts4 = np.ones((pts_local.shape[0], 4), dtype=np.float32)
+        pts4[:, :3] = pts_local.astype(np.float32, copy=False)
+
+        pts_robot4 = (M_sr @ pts4.T).T   # colonne -> colonne
+        return pts_robot4[:, :3]
+
+
+
+    # def _to_robot_frame(self, pts_local: np.ndarray, sensor_transform: carla.Transform):
+    #     if pts_local is None or pts_local.size == 0:
+    #         return np.zeros((0, 3), dtype=np.float32)
+
+    #     # sensor -> world
+    #     M_sw = np.array(sensor_transform.get_matrix(), dtype=np.float32)
+
+    #     # world -> robot(T0)
+    #     ref = self.reference_robot_transform
+    #     robot_tf = carla.Transform(
+    #         carla.Location(**ref["location"]),
+    #         carla.Rotation(**ref["rotation"])
+    #     )
+    #     M_wr = np.array(robot_tf.get_inverse_matrix(), dtype=np.float32)
+
+    #     # undo global bank offset (world)
+    #     dxo, dyo, dzo = self.bank_global_offset_world
+    #     M_undo = np.eye(4, dtype=np.float32)
+    #     M_undo[0, 3] = -dxo
+    #     M_undo[1, 3] = -dyo
+    #     M_undo[2, 3] = -dzo
+
+    #     # sensor -> robot
+    #     M_sr = M_wr @ M_undo @ M_sw
+
+    #     pts4 = np.ones((pts_local.shape[0], 4), dtype=np.float32)
+    #     pts4[:, :3] = pts_local.astype(np.float32, copy=False)
+
+    #     pts_robot4 = (M_sr @ pts4.T).T
+    #     return pts_robot4[:, :3]
+
+
 
     def set_reference_robot(self, position: dict):
         """Fixe le repère ROBOT T0 pour la frame courante."""
@@ -432,28 +491,28 @@ class PersistentSensorManager:
                         pass
             if cleaned:
                 print(f" ✅ {cleaned} capteurs orphelins supprimés")
-                [self.world.tick() for _ in range(2)]
+                [self.world.tick() for _ in range(1)]
                 # time.sleep(0.1)
             return cleaned
 
-    def apply_camera_blur(self, image, weather_preset=None):
-        if not self.enable_blur:
-            return image
-        blur_intensity = 1
-        if weather_preset:
-            if 'foggy' in weather_preset:
-                blur_intensity = 5
-            elif 'rainy' in weather_preset or 'storm' in weather_preset:
-                blur_intensity = 3
-            elif 'night' in weather_preset:
-                blur_intensity = 2
-        k = (2 * blur_intensity + 1, 2 * blur_intensity + 1)
-        with SectionTimer(self.perf, "camera_blur"):
-            blurred = cv2.GaussianBlur(image, k, 0)
-            if weather_preset and ('rainy' in weather_preset):
-                noise = np.random.normal(0, 10, image.shape).astype(np.uint8)
-                blurred = cv2.add(blurred, noise)
-        return blurred
+    # def apply_camera_blur(self, image, weather_preset=None):
+    #     if not self.enable_blur:
+    #         return image
+    #     blur_intensity = 1
+    #     if weather_preset:
+    #         if 'foggy' in weather_preset:
+    #             blur_intensity = 5
+    #         elif 'rainy' in weather_preset or 'storm' in weather_preset:
+    #             blur_intensity = 3
+    #         elif 'night' in weather_preset:
+    #             blur_intensity = 2
+    #     k = (2 * blur_intensity + 1, 2 * blur_intensity + 1)
+    #     with SectionTimer(self.perf, "camera_blur"):
+    #         blurred = cv2.GaussianBlur(image, k, 0)
+    #         if weather_preset and ('rainy' in weather_preset):
+    #             noise = np.random.normal(0, 10, image.shape).astype(np.uint8)
+    #             blurred = cv2.add(blurred, noise)
+    #     return blurred
 
 
     def move_cameras_to_position(self, position: dict):
@@ -521,7 +580,7 @@ class PersistentSensorManager:
                             lidar_bp = bp_library.find('sensor.lidar.ray_cast_semantic')
                             lidar_bp.set_attribute('channels', str(cfg['channels']))
                             lidar_bp.set_attribute('points_per_second', str(cfg['pps']))
-                            lidar_bp.set_attribute('rotation_frequency', '5')
+                            lidar_bp.set_attribute('rotation_frequency', '6')
                             lidar_bp.set_attribute('range', str(cfg['range']))
                             lidar_bp.set_attribute('upper_fov', str(cfg['upper_fov']))
                             lidar_bp.set_attribute('lower_fov', str(cfg['lower_fov']))
@@ -622,7 +681,8 @@ class PersistentSensorManager:
                         # Version optimisée pour BiFPN (Multiple de 32) basée sur 4080x3072
                         cam_bp.set_attribute('image_size_x', '512')
                         cam_bp.set_attribute('image_size_y', '384')
-
+                        cam_bp.set_attribute('bloom_intensity', '0.0')
+                        cam_bp.set_attribute('lens_flare_intensity', '0.0')
                         # --- OPTIQUE ---
                         # Utilisation du Horizontal FOV exact de votre fiche technique
                         cam_bp.set_attribute('fov', '71.4')
@@ -631,6 +691,7 @@ class PersistentSensorManager:
                         # # Simulation de l'ouverture f/1.9
                         # cam_bp.set_attribute('exposure_mode', 'Manual')
                         cam_bp.set_attribute('fstop', '1.9')
+                        cam_bp.set_attribute('shutter_speed', '500')   # 1/10s
 
                         # # --- NETTOYAGE (Optique pure sans bruit) ---
                         # # Désactivation de la distorsion pour simuler le post-process Google
@@ -680,7 +741,7 @@ class PersistentSensorManager:
 
                 self.sensors_created = True
                 print(f"✅ {len(self.lidars)} LiDARs et {len(self.cameras)} caméras créés")
-                for _ in range(2):
+                for _ in range(1):
                     self.world.tick()
                 # time.sleep(0.1)
                 return True
@@ -696,6 +757,7 @@ class PersistentSensorManager:
         slot_to_pose: dict slot s in [-N..N] -> pose dict {'location','rotation',...}
         global_offset_world: (dx,dy,dz) ajouté en world après projection
         """
+        self.bank_global_offset_world = tuple(map(float, global_offset_world))
         dxo, dyo, dzo = map(float, global_offset_world)
 
         for slot, rig in self.lidar_rigs.items():
@@ -804,8 +866,8 @@ class PersistentSensorManager:
         channels_range=(512, 1024),
         upper_fov=(40.0, 60.0),
         lower_fov=(-60.0, -40.0),
-        pps_range=(2_000_000, 4_100_000),
-        rotation_frequency='5',
+        pps_range=(500_000, 2_100_000),
+        rotation_frequency='6',
     ):
         for lidar in self.lidars:
             if not (lidar and lidar.is_alive):
@@ -860,7 +922,7 @@ class PersistentSensorManager:
             with self.lock:
                 for name, img in self.camera_data.items():
                     if img is not None:
-                        images[name] = self.apply_camera_blur(img.copy(), weather_preset)
+                        images[name] = img #self.apply_camera_blur(img.copy(), weather_preset)
         return {
             'points': points,
             'labels': labels,
@@ -927,8 +989,8 @@ class FastDatasetGenerator:
         cam_height_noise_pct: float = 5.0,
         cam_angle_noise_pct: float = 5.0,
         # fenêtre ego
-        window_back: int = 20,
-        window_forward: int = 20,
+        window_back: int = 2,
+        window_forward: int = 2,
         proximity_radius: float = 0.5,
         lidar_layout_if_clear: Optional[List[float]] = None,
         allowed_semantic_tags: Optional[List[int]] = None,
@@ -946,12 +1008,6 @@ class FastDatasetGenerator:
         lidar_empty_points_per_hit: int = 2,
     ):
         
-
-        self.window_back = 0
-        self.window_forward = 0
-        self.lidar_rigs = {}          # dict[int] -> list[carla.Actor]
-        self.lidar_slot_ids = []      # slots ordonnés: [-N..N]
-        self.lidar_actor_to_slot = {} # actor_id -> slot j
 
         self.output_dir = output_dir
         self.previews_dir = os.path.join(output_dir, previews_dir_name)
@@ -1098,8 +1154,15 @@ class FastDatasetGenerator:
                     settings.synchronous_mode = True
                     settings.fixed_delta_seconds = 0.2
                     settings.no_rendering_mode = False
+                    
+                    # 3. Configurer le Substepping pour garder une physique parfaite
+                    settings.substepping = True
+                    settings.max_substep_delta_time = 0.01
+                    settings.max_substeps = 50
+                    
                     self.world.apply_settings(settings)
 
+                    
                 with SectionTimer(self.perf, "apply_weather"):
                     self.weather_manager = WeatherManager(self.world)
                     self.fixed_weather_name = self.weather_manager.apply_by_id(self.weather_id)
@@ -1129,7 +1192,7 @@ class FastDatasetGenerator:
                     pass
             if batch:
                 self.client.apply_batch_sync(batch, True)
-            for _ in range(2):
+            for _ in range(1):
                 self.world.tick()
 
     def _render_preview(self, points_xyz: np.ndarray, labels: np.ndarray, frame_id: int, out_path: str):
@@ -1617,7 +1680,7 @@ class FastDatasetGenerator:
             for name, img in frame_data['images'].items():
                 if img is not None:
                     img_path = os.path.join(self.output_dir, "images", f"frame_{formatted_id}_{name}.jpg")
-                    cv2.imwrite(img_path, img)  # img est déjà en BGR
+                    cv2.imwrite(img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 100])  # img est déjà en BGR
                     saved_images += 1
 
         # PREVIEW dense (sur les points finals occupancy implicite)
@@ -1728,24 +1791,48 @@ class FastDatasetGenerator:
                 # ------------------------------------------------
                 self.sensor_manager.set_reference_robot(ref_position)
                 self.sensor_manager.move_cameras_to_position(ref_position)
+                
+                with self.sensor_manager.lock:
+                    for k in self.sensor_manager.camera_received:
+                        self.sensor_manager.camera_received[k] = False
 
+                # tick "de plus" (voire 2 ticks) pour laisser la cam produire une image fraîche
+                self.world.tick()
+                self.world.tick()
+                # attends la frame caméra (max 5 ticks)
+                for _ in range(20):
+                    with self.sensor_manager.lock:
+                        if all(self.sensor_manager.camera_received.values()):
+                            break
+                    self.world.tick()
+                
+                x0 = float(ref_position["location"]["x"])
+                y0 = float(ref_position["location"]["y"])
+                z0 = float(ref_position["location"]["z"])
+                pitch0 = float(ref_position["rotation"].get("pitch", 0.0))
+                roll0  = float(ref_position["rotation"].get("roll", 0.0))
                 # ------------------------------------------------
                 # Construire mapping slot -> pose
                 # ------------------------------------------------
                 slot_to_pose = {}
-
                 for s in self.sensor_manager.lidar_slot_ids:
                     j = pos_idx + s
                     if j < 0 or j >= len(self.positions):
                         continue
 
                     pj = self.positions[j]
-                    slot_to_pose[int(s)] = {
-                        'location': pj['ego_location'],
-                        'rotation': pj['ego_rotation'],
-                        'timestamp_sim': pj['timestamp_sim']
+                    pose_j = {
+                        "location": dict(pj["ego_location"]),
+                        "rotation": dict(pj["ego_rotation"]),
+                        "timestamp_sim": pj["timestamp_sim"],
                     }
+                    pose_j["location"]["x"] = x0
+                    pose_j["location"]["y"] = y0
+                    pose_j["location"]["z"] = z0
+                    pose_j["rotation"]["pitch"] = pitch0
+                    pose_j["rotation"]["roll"]  = roll0
 
+                    slot_to_pose[int(s)] = pose_j
                 print(f"🧭 rigs actifs: {len(slot_to_pose)}")
 
                 # ------------------------------------------------
@@ -1889,15 +1976,15 @@ def main():
     parser.add_argument('--tm-port', type=int, default=8000, help='Port du Traffic Manager')
     parser.add_argument('--seed', type=int, default=42, help='Seed')
 
-    parser.add_argument('--z-min', type=float, default=0.1, help='Hauteur min relative LiDAR (m)')
-    parser.add_argument('--z-max', type=float, default=4, help='Hauteur max relative LiDAR (m)')
-    parser.add_argument('--z-step', type=float, default=4, help='Pas entre LiDARs (m)')
+    parser.add_argument('--z-min', type=float, default=1, help='Hauteur min relative LiDAR (m)')
+    parser.add_argument('--z-max', type=float, default=2, help='Hauteur max relative LiDAR (m)')
+    parser.add_argument('--z-step', type=float, default=2, help='Pas entre LiDARs (m)')
     parser.add_argument('--h-fov', type=float, default=360.0, help='FOV horizontal (deg)')
-    parser.add_argument('--v-upper', type=float, default=30.0, help='FOV vertical haut (deg)')
-    parser.add_argument('--v-lower', type=float, default=-30.0, help='FOV vertical bas (deg)')
-    parser.add_argument('--lidar-channels', type=int, default=512, help='Canaux LiDAR')
+    parser.add_argument('--v-upper', type=float, default=60.0, help='FOV vertical haut (deg)')
+    parser.add_argument('--v-lower', type=float, default=-60.0, help='FOV vertical bas (deg)')
+    parser.add_argument('--lidar-channels', type=int, default=700, help='Canaux LiDAR')
     parser.add_argument('--lidar-pps', type=int, default=500_000, help='Points/seconde LiDAR')
-    parser.add_argument('--lidar-range', type=float, default=1000, help='Portée LiDAR (m)')
+    parser.add_argument('--lidar-range', type=float, default=150, help='Portée LiDAR (m)')
 
     parser.add_argument('--map', type=str, default='Town10HD_Opt', help='Carte CARLA')
     parser.add_argument('--trajectory-json', type=str,
@@ -1906,11 +1993,11 @@ def main():
     parser.add_argument('--weather-id', type=int, default=0,
                         help='0 clear_noon | 1 overcast_morning | ...')
     parser.add_argument('--profile', action='store_true', default=True, help='Activer le profiling')
-    parser.add_argument('--capture-points', type=int, default=2_000_000,
+    parser.add_argument('--capture-points', type=int, default=1_500_000,
                         help='Quota de points LiDAR à capturer par frame (hits + empty)')
-    parser.add_argument('--points-min-saved', type=int, default=55_000,
+    parser.add_argument('--points-min-saved', type=int, default=20_000,
                         help='Nb min de points occupancy sauvegardés par frame')
-    parser.add_argument('--points-max-saved', type=int, default=60_000,
+    parser.add_argument('--points-max-saved', type=int, default=30_000,
                         help='Nb max de points occupancy sauvegardés par frame')
     parser.add_argument('--cube-size-m', type=float, default=0.005,
                         help='Taille “visuelle” du marker dans la preview (m)')
@@ -1938,7 +2025,7 @@ def main():
                         help="Taille des voxels occupancy implicite (m)")
     parser.add_argument('--implicit-points-per-voxel-min', type=int, default=1,
                         help="Nb min de points par voxel")
-    parser.add_argument('--implicit-points-per-voxel-max', type=int, default=2,
+    parser.add_argument('--implicit-points-per-voxel-max', type=int, default=3,
                         help="Nb max de points par voxel")
     parser.add_argument('--implicit-ratio-occ', type=float, default=0.8,
                         help="Ratio approx de points occupés dans le dataset implicite")
@@ -1950,7 +2037,7 @@ def main():
                         help="Proportion de voxels empty gardés")
     parser.add_argument('--voxel-keep-ratio-unknown', type=float, default=0.1,
                         help="Proportion de voxels unknown gardés")
-    parser.add_argument('--implicit-empty-points-per-hit', type=int, default=4,
+    parser.add_argument('--implicit-empty-points-per-hit', type=int, default=1,
                         help="Nb de points empty à tirer par hit LiDAR dans les callbacks")
 
     args = parser.parse_args()
