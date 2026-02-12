@@ -331,6 +331,25 @@ class PersistentSensorManager:
         self.lidar_accumulator = LidarAccumulatorUntilTarget(self.capture_points_target)
         self.current_pose_j = None
 
+        # Cam config :
+        self.cam_capture_w = 2048
+        self.cam_capture_h = 1536
+
+        # Résolution finale (réseau)
+        self.cam_out_w = 512
+        self.cam_out_h = 384
+
+        self._img_q = Queue(maxsize=256)  # buffer, évite les stalls
+        self._img_workers = []
+        self._img_workers_n = max(2, (os.cpu_count() or 4) // 2)
+
+        for _ in range(self._img_workers_n):
+            t = Thread(target=self._image_worker, daemon=True)
+            t.start()
+            self._img_workers.append(t)
+
+
+
         self.window_back = int(window_back)
         self.window_forward = int(window_forward)
         self.lidar_slot_ids = list(range(-self.window_back, self.window_forward + 1))
@@ -398,6 +417,49 @@ class PersistentSensorManager:
             [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
             [-sp, cp * sr, cp * cr]
         ], dtype=np.float32)
+
+    def _enqueue_image(self, cam_name: str, raw_bytes: bytes, w: int, h: int):
+        """
+        Enqueue non-bloquant : si la queue est pleine, on drop l'image
+        (mieux: perdre une frame que bloquer toute la sim).
+        """
+        try:
+            self._img_q.put_nowait((cam_name, raw_bytes, w, h))
+        except Exception:
+            # Queue pleine -> drop
+            pass
+
+    def _image_worker(self):
+        """
+        Worker: raw BGRA -> BGR -> resize -> store (uint8) en 512x384
+        """
+        while True:
+            cam_name, raw_bytes, w, h = self._img_q.get()
+            try:
+                # raw BGRA (CARLA Raw)
+                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+                arr = arr.reshape((h, w, 4))
+
+                # BGR (OpenCV) : slice view, resize fait la copie finale
+                bgr = arr[:, :, :3]
+
+                # Downsample haute qualité + rapide (AREA = bon pour réduire)
+                small = cv2.resize(
+                    bgr,
+                    (self.cam_out_w, self.cam_out_h),
+                    interpolation=cv2.INTER_AREA
+                )
+
+                # Store (petit, contiguous)
+                with self.lock:
+                    self.camera_data[cam_name] = small  # uint8 (H,W,3)
+                    self.camera_received[cam_name] = True
+            except Exception:
+                pass
+            finally:
+                self._img_q.task_done()
+
+
 
     @staticmethod
     def _T_translate(dx: float, dy: float, dz: float) -> np.ndarray:
@@ -679,8 +741,8 @@ class PersistentSensorManager:
                         cam_bp = bp_library.find('sensor.camera.rgb')
                         # --- RÉSOLUTIONS ---
                         # Version optimisée pour BiFPN (Multiple de 32) basée sur 4080x3072
-                        cam_bp.set_attribute('image_size_x', '512')
-                        cam_bp.set_attribute('image_size_y', '384')
+                        cam_bp.set_attribute('image_size_x', str(self.cam_capture_w))
+                        cam_bp.set_attribute('image_size_y', str(self.cam_capture_h))
                         cam_bp.set_attribute('bloom_intensity', '0.0')
                         cam_bp.set_attribute('lens_flare_intensity', '0.0')
                         # --- OPTIQUE ---
@@ -728,11 +790,8 @@ class PersistentSensorManager:
                             def _cb(image):
                                 try:
                                     image.convert(carla.ColorConverter.Raw)
-                                    array = np.frombuffer(image.raw_data, dtype=np.uint8)
-                                    array = np.reshape(array, (image.height, image.width, 4))[:, :, :3]
-                                    with self.lock:
-                                        self.camera_data[name] = array.copy()
-                                        self.camera_received[name] = True
+                                    raw = bytes(image.raw_data)  # copie nécessaire: buffer CARLA volatile
+                                    self._enqueue_image(name, raw, image.width, image.height)
                                 except Exception:
                                     pass
                             return _cb
@@ -1675,13 +1734,33 @@ class FastDatasetGenerator:
             )
 
         # Sauvegarde des images
+        # Sauvegarde des images (encode en parallèle)
         saved_images = 0
         with SectionTimer(self.perf, "save_images_jpg"):
-            for name, img in frame_data['images'].items():
-                if img is not None:
-                    img_path = os.path.join(self.output_dir, "images", f"frame_{formatted_id}_{name}.jpg")
-                    cv2.imwrite(img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 100])  # img est déjà en BGR
-                    saved_images += 1
+            imgs = [(name, img) for name, img in frame_data['images'].items() if img is not None]
+
+            def _encode_and_write(name_img):
+                name, img = name_img
+                img_path = os.path.join(self.output_dir, "images", f"frame_{formatted_id}_{name}.jpg")
+
+                # encode en mémoire (souvent + rapide que imwrite direct)
+                ok, buf = cv2.imencode(
+                    ".jpg",
+                    img,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95]  # 95 = quasi-lossless, bien plus rapide que 100
+                )
+                if ok:
+                    with open(img_path, "wb") as f:
+                        f.write(buf.tobytes())
+                    return 1
+                return 0
+
+            if imgs:
+                from concurrent.futures import ThreadPoolExecutor
+                n_workers = min(8, max(2, (os.cpu_count() or 8) // 2))
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    for r in ex.map(_encode_and_write, imgs):
+                        saved_images += int(r)
 
         # PREVIEW dense (sur les points finals occupancy implicite)
         preview_path = None
