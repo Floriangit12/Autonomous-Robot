@@ -2802,11 +2802,11 @@ class FastDatasetGenerator:
                 with SectionTimer(self.perf, "move_all_lidar_rigs_initial"):
                     self.sensor_manager.move_all_lidar_rigs(slot_to_pose, global_offset_world=(0.0, 0.0, 0.0))
 
-                # 2) Randomize (Jitter) en LOCAL/WORLD *avant* l'offset global d'évitement
-                # Cela évite de "undo" le jitter lors de la reconstruction si on considère le jitter comme une perturbation physique
-                if self.randomize_clear_poses and (not self.one_cam_tick_per_pose):
-                    with SectionTimer(self.perf, "randomize_all_lidars_before_offset"):
-                        self.sensor_manager.randomize_all_lidars_params()
+                # 2) Randomize (Jitter) : SUPPRIMÉ ici car il serait écrasé par move_all_lidar_rigs (offset global).
+                # On ne conserve que le jitter final (après offset) mais avec des bornes réduites pour ne pas causer de collisions.
+                # if self.randomize_clear_poses and (not self.one_cam_tick_per_pose):
+                #    with SectionTimer(self.perf, "randomize_all_lidars_before_offset"):
+                #        self.sensor_manager.randomize_all_lidars_params()
 
                 # 3) Calculer l'offset global d'évitement (sur la base des positions perturbées ou non)
                 if self.one_cam_tick_per_pose:
@@ -2822,27 +2822,21 @@ class FastDatasetGenerator:
 
                 # 4) Appliquer l'offset global (déplace tout le monde)
                 # Note: move_all_lidar_rigs ré-applique la pose de base + offset.
-                # SI on a fait un jitter avant, move_all_lidar_rigs va L'ANNULER car il repart de 'slot_to_pose'.
-                # CORRECTION: Si on veut garder le jitter + offset, il faut soit:
-                # a) Appliquer le jitter APRÈS l'offset (mais risque de collision, comme noté par la critique)
-                # b) Modifier slot_to_pose ? Non.
-                # c) Faire move_all_lidar_rigs_final, PUIS re-appliquer le jitter localement.
-                #
-                # La critique dit: "Ne randomize pas en WORLD après ou randomize en LOCAL (dans le repère ego) avant l’offset global".
-                # Pour faire simple et respecter "pas de copies inutiles/logique simple":
-                # On fait move_all (offset), PUIS randomize (local pertb).
-                # Si le randomize est petit, le risque de collision post-offset est faible.
-                
                 with SectionTimer(self.perf, "move_all_lidar_rigs_final"):
                     self.sensor_manager.move_all_lidar_rigs(slot_to_pose, global_offset_world=(dx, dy, dz))
 
                 # On applique le Jitter MAINTENANT (sur la pose finale avec offset)
-                # Mais attention à randomize_all_lidars_params qui modifie en WORLD.
-                # Si on modifie en world, on "casse" potentiellement l'offset de sécurité si la perturbation est grande.
-                # Mais c'est le seul moyen simple sans refondre tout le code de transformation.
+                # On réduit fortement les bornes (2cm, 1-2 deg) pour garantir que l'offset de sécurité reste valide.
                 if self.randomize_clear_poses and (not self.one_cam_tick_per_pose):
                      with SectionTimer(self.perf, "randomize_all_lidars_final"):
-                        self.sensor_manager.randomize_all_lidars_params()
+                        self.sensor_manager.randomize_all_lidars_params(
+                            loc_jitter_x=(-0.02, 0.02),
+                            loc_jitter_y=(-0.02, 0.02),
+                            loc_jitter_z=(-0.02, 0.02),
+                            pitch_jitter=(-1.0, 1.0),
+                            yaw_jitter=(-5.0, 5.0), # On garde un peu plus de yaw car moins critique pour collisions latérales
+                            roll_jitter=(-1.0, 1.0)
+                        )
 
                 # Barrière "capteurs bien déplacés":
                 # - mode one_cam_tick: on veut STRICTEMENT 1 tick total (pas de settle tick)
