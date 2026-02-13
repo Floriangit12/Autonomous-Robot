@@ -250,7 +250,7 @@ CARLA_22 = [
 class VoxelConfig:
     x_range: Tuple[float, float] = (-16.0, 16.0)
     y_range: Tuple[float, float] = (-16.0, 16.0)
-    z_range: Tuple[float, float] = (-2.0, 4.0)
+    z_range: Tuple[float, float] = (-1.0, 3.0)
     voxel_size: float = 0.5
 
     @property
@@ -890,7 +890,7 @@ class PersistentSensorManager:
 
                     x_min_d, x_max_d = -16.0, 16.0
                     y_min_d, y_max_d = -16.0, 16.0
-                    z_min_d, z_max_d = -2.0, 8.0
+                    z_min_d, z_max_d = -1.0, 3.0
 
                     def _roi_ratio(p3: np.ndarray) -> float:
                         if p3.size == 0:
@@ -962,7 +962,7 @@ class PersistentSensorManager:
                 k = int(empty_k)
                 if k > 0:
                     n_hits = len(pts_local)
-                    max_range_m = 16.0
+                    max_range_m = 24.0
                     d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
                     s_max = np.minimum(0.98, max_range_m / (d + 1e-6)).astype(np.float32)
                     s_max = np.where(d <= max_range_m, np.float32(0.98), s_max)
@@ -975,7 +975,7 @@ class PersistentSensorManager:
                 # UNKNOWN
                 pts_robot_unk = np.zeros((0, 3), dtype=np.float32)
                 lbl_unk = np.zeros((0,), dtype=np.uint8)
-                max_range_m = 16.0
+                max_range_m = 24.0
                 d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
                 valid = (d > 1e-3) & (d < max_range_m - 1e-3)
                 if np.any(valid):
@@ -1096,7 +1096,7 @@ class PersistentSensorManager:
                     # ROI attendue (celle du dataset implicite)
                     x_min_d, x_max_d = -16.0, 16.0
                     y_min_d, y_max_d = -16.0, 16.0
-                    z_min_d, z_max_d = -2.0, 8.0
+                    z_min_d, z_max_d = -1.0, 3.0
 
                     def _roi_ratio(p3: np.ndarray) -> float:
                         if p3.size == 0:
@@ -1818,7 +1818,7 @@ class FastDatasetGenerator:
         self.voxel_cfg = VoxelConfig(
             x_range=(-16.0, 16.0),
             y_range=(-16.0, 16.0),
-            z_range=(-2.0, 8.0),
+            z_range=(-1.0, 3.0),
             voxel_size=implicit_voxel_size
         )
 
