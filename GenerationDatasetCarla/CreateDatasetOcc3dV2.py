@@ -34,7 +34,7 @@ from datetime import datetime
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, List, Dict, Optional, Set
 import gc
 import math
 import matplotlib
@@ -51,22 +51,82 @@ from threading import Thread
 LIDAR_EMPTY_SENTINEL = 254
 LIDAR_UNKNOWN_SENTINEL = 253
 
+# Debug transform (matrices + transpose). Laisse False en prod (ça spam).
+DEBUG_LIDAR_TRANSFORMS = False
+# À partir de quel frame on commence à imprimer le debug TF (utile sur runs longs).
+DEBUG_LIDAR_TRANSFORMS_START_FRAME = 0
+
+
+# NOTE: ProcessPoolExecutor est volontairement évité ici (Windows + gros buffers images -> pickle/copies très coûteuses).
+
+
+def _worker_write_jpeg(args):
+    
+    img, path, quality = args
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if ok:
+        with open(path, "wb") as f:
+            f.write(buf.tobytes())
+        return True
+    return False
+
+def _worker_process_image(args):
+    """
+    Tourne sur 8 coeurs en parallèle.
+    Fait le Resize (SSAA) ET l'encodage JPEG + Écriture.
+    args: (high_res_img, path, target_dims, quality)
+    """
+    import cv2
+    img, path, (tw, th), quality = args
+    try:
+        # 1. Resize haute qualité (INTER_AREA est idéal pour réduire sans aliasing)
+        small_img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+        # 2. Encodage JPEG
+        ok, buf = cv2.imencode(".jpg", small_img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if ok:
+            with open(path, "wb") as f:
+                f.write(buf.tobytes())
+            return True
+    except Exception as e:
+        print(f"❌ Erreur worker image: {e}")
+    return False
+
+
+
+
 
 # Thread pour le npz 
 
 class AsyncWriter(Thread):
     def __init__(self, save_fn):
         super().__init__(daemon=True)
-        self.queue = Queue(maxsize=50) # Buffer de 50 frames
+        self.queue = Queue(maxsize=500)
         self.save_fn = save_fn
         self.start()
 
     def run(self):
         while True:
             data, frame_id, ref_pos = self.queue.get()
-            self.save_fn(data, frame_id, ref_pos)
+            try:
+                self.save_fn(data, frame_id, ref_pos)
+            except Exception:
+                traceback.print_exc()
             self.queue.task_done()
 
+class AsyncImageWriter(Thread):
+    def __init__(self, maxsize=512*4):
+        super().__init__(daemon=True)
+        self.q = Queue(maxsize=maxsize)
+        self.start()
+
+    def run(self):
+        while True:
+            path, jpg_bytes = self.q.get()
+            try:
+                with open(path, "wb") as f:
+                    f.write(jpg_bytes)
+            finally:
+                self.q.task_done()
 
 # ==========================
 # PROFILING
@@ -76,11 +136,17 @@ class PerfStats:
         self.t_tot = defaultdict(float)
         self.count = defaultdict(int)
         self.samples = defaultdict(list)
+        self.callback_times = defaultdict(list)  # Pour callbacks avec détails
 
     def add(self, label: str, dt: float):
         self.t_tot[label] += dt
         self.count[label] += 1
         self.samples[label].append(dt)
+    
+    def add_callback(self, callback_type: str, dt: float, detail: str = ""):
+        """Enregistre les temps des callbacks avec détails"""
+        key = f"{callback_type}_{detail}" if detail else callback_type
+        self.callback_times[key].append(dt)
 
     def global_report(self):
         items = sorted(self.t_tot.items(), key=lambda x: x[1], reverse=True)
@@ -94,6 +160,25 @@ class PerfStats:
             avg = (total / n) if n else 0.0
             print(f" - {label:<28s} total={total:8.3f}s  avg={avg:7.4f}s  "
                   f"min={mn:7.4f}s  max={mx:7.4f}s  (n={n})")
+        
+        # Rapport des callbacks
+        if self.callback_times:
+            print("\n" + "=" * 70)
+            print("⚡ ANALYSE CALLBACKS")
+            cb_items = sorted(self.callback_times.items())
+            for cb_type, times in cb_items:
+                if times:
+                    arr = np.array(times, dtype=np.float64)
+                    total_cb = np.sum(arr)
+                    n = len(arr)
+                    avg = np.mean(arr)
+                    mn = np.min(arr)
+                    mx = np.max(arr)
+                    p95 = np.percentile(arr, 95)
+                    p99 = np.percentile(arr, 99)
+                    print(f" - {cb_type:<32s} total={total_cb:8.3f}s  avg={avg:7.4f}s  "
+                          f"min={mn:7.4f}s  p95={p95:7.4f}s  p99={p99:7.4f}s  max={mx:7.4f}s  (n={n})")
+        
         print("=" * 70 + "\n")
 
 
@@ -156,6 +241,11 @@ CARLA_22 = [
 ]
 
 
+
+
+
+
+
 @dataclass
 class VoxelConfig:
     x_range: Tuple[float, float] = (-16.0, 16.0)
@@ -169,6 +259,12 @@ class VoxelConfig:
         ny = int((self.y_range[1] - self.y_range[0]) / self.voxel_size)
         nz = int((self.z_range[1] - self.z_range[0]) / self.voxel_size)
         return (max(nx, 1), max(ny, 1), max(nz, 1))
+
+
+
+
+
+
 
 
 # ==========================
@@ -321,9 +417,14 @@ class PersistentSensorManager:
         self.sensor_ids = set()
         self.lidars = []
         self.cameras = []
+        self.camera_callbacks = {}
+        self.cameras_active = True
         self.sensors_created = False
         self.current_robot_transform = None
         self.reference_robot_transform = None
+        # Matrice world->robot(T0) figée au moment où on fixe T0.
+        # But: éviter toute dérive/oscillation si on reconstruit des Transform ailleurs.
+        self.reference_robot_M_wr: Optional[np.ndarray] = None
         self.camera_data: Dict[str, np.ndarray] = {}
         self.camera_received: Dict[str, bool] = {}
         self.lock = threading.Lock()
@@ -331,24 +432,51 @@ class PersistentSensorManager:
         self.lidar_accumulator = LidarAccumulatorUntilTarget(self.capture_points_target)
         self.current_pose_j = None
 
+        # ✅ AJOUT : frame caméra qu’on veut garder (T0)
+        self.target_cam_frame = None
+
+        # ✅ AJOUT : frame LiDAR qu’on accepte (utile en mode 1 tick/pose strict)
+        self.target_lidar_frame = None
+
+        # Suivi des callbacks LiDAR reçus pour le frame attendu.
+        # En mode 1 tick/pose, sans une courte attente (sans tick) on peut capturer
+        # avant l'arrivée de toutes les callbacks => sorties (NPZ) quasi vides et oscillantes.
+        self._lidar_seen_frame: Optional[int] = None
+        self._lidar_seen_sensor_ids: Set[int] = set()
+
         # Cam config :
-        self.cam_capture_w = 2048
-        self.cam_capture_h = 1536
+        self.cam_capture_w = 512*2
+        self.cam_capture_h = 384*2
 
         # Résolution finale (réseau)
         self.cam_out_w = 512
         self.cam_out_h = 384
 
+        # Combien de temps on attend (sans tick) pour que les JPEG soient prêts
+        # après réception des frames brutes.
+        self.cam_encode_wait_timeout_s = 0.75
+
         self._img_q = Queue(maxsize=256)  # buffer, évite les stalls
         self._img_workers = []
-        self._img_workers_n = max(2, (os.cpu_count() or 4) // 2)
-
+        self._img_workers_n = 16
+        
         for _ in range(self._img_workers_n):
             t = Thread(target=self._image_worker, daemon=True)
             t.start()
             self._img_workers.append(t)
 
+        # LiDAR: pipeline async (callback ultra-légère -> workers)
+        self._lidar_q = Queue(maxsize=512)
+        self._lidar_workers = []
+        self._lidar_workers_n = max(12, min(12, int(os.cpu_count() or 8)))
+        for _ in range(self._lidar_workers_n):
+            t = Thread(target=self._lidar_worker, daemon=True)
+            t.start()
+            self._lidar_workers.append(t)
 
+        # Anti-doublon (capteur -> 1 message / frame)
+        self._lidar_enqueued_frame: Optional[int] = None
+        self._lidar_enqueued_sensor_ids: Set[int] = set()
 
         self.window_back = int(window_back)
         self.window_forward = int(window_forward)
@@ -382,13 +510,65 @@ class PersistentSensorManager:
             {'dx': -0.2, 'dy': -0.2, 'dz': robot_height, 'pitch': 0.0, 'yaw': -135, 'name': 'back_left',   'fov': 71.4},
             {'dx': -0.2, 'dy': 0.2,  'dz': robot_height, 'pitch': 0.0, 'yaw': 135,  'name': 'back_right',  'fov': 71.4},
         ]
-        
+
+
+        self._lidar_tf_cache = {}  # (frame_id, sensor_id) -> carla.Transform
+        # Transform attendue (sensor->world) après move_all_lidar_rigs().
+        # Plus robuste que data.transform (qui peut être incohérent selon le backend/latence).
+        self._lidar_expected_M_sw: Dict[int, np.ndarray] = {}  # sensor_id -> 4x4
+        self.image_writer = AsyncImageWriter()
+        self.camera_jpeg = {}          # cam_name -> bytes
+        self.camera_received = {cfg['name']: False for cfg in self.CAMERA_CONFIGS}
+        # Empêche de ré-enqueue la même caméra tant que le worker n'a pas fini
+        self.camera_pending = {cfg['name']: False for cfg in self.CAMERA_CONFIGS}
+        self.camera_frame_id = {cfg['name']: -1 for cfg in self.CAMERA_CONFIGS}
+        self.camera_jpeg_frame_id = {cfg['name']: -1 for cfg in self.CAMERA_CONFIGS}
+        self.target_cam_frame = None
+
+        self._accum_epoch = 0
         self.cam_height_noise_pct = float(cam_height_noise_pct)
         self.cam_angle_noise_pct = float(cam_angle_noise_pct)
 
         self.empty_points_per_hit = max(int(empty_points_per_hit), 0)
 
+        # Debug transform: compare conventions (colonne vs ligne/transposée).
+        # Objectif: voir si un mauvais transpose laisse les points en world.
+        self.debug_lidar_transforms = bool(DEBUG_LIDAR_TRANSFORMS)
+        self._dbg_tf_prints_left = 10
+        self._dbg_tf_last_frame_printed = None
+
+        # Convention d'application des matrices 4x4 (détectée une fois).
+        # Possibles: "col" (M@p), "colT" (M.T@p), "row" (p@M), "rowT" (p@M.T)
+        # Note: pour "row*", l'ordre de composition des matrices doit être inversé.
+        self._tf_apply_mode: Optional[str] = None
+
         print("🎯 CAPTURE LiDAR/CAM — repère robot T0 + multi-poses")
+
+    def set_cameras_active(self, active: bool):
+        """Active/désactive les caméras (stop/listen) pour réduire le coût de rendu.
+
+        Utile pour un downsample temporel: on ne capture les images que 1 pose sur N,
+        mais on garde la résolution intacte.
+        """
+        active = bool(active)
+        if self.cameras_active == active:
+            return
+
+        for cam, cfg in zip(self.cameras, self.CAMERA_CONFIGS):
+            if not (cam and cam.is_alive):
+                continue
+            name = cfg['name']
+            try:
+                if active:
+                    cb = self.camera_callbacks.get(name, None)
+                    if cb is not None:
+                        cam.listen(cb)
+                else:
+                    cam.stop()
+            except Exception:
+                pass
+
+        self.cameras_active = active
 
     def _build_z_stack_configs(self):
         cfgs = []
@@ -407,6 +587,176 @@ class PersistentSensorManager:
             z += self.params['z_step']
         return cfgs
 
+    def _expected_lidar_callbacks(self) -> int:
+        # Nombre de capteurs LiDAR actifs = (slots) * (configs z-stack actives)
+        n_cfg = sum(1 for x in self.active_lidar_mask if x)
+        return int(n_cfg) * int(len(self.lidar_slot_ids))
+
+    def cache_lidar_transforms_for_frame(self, frame_id: int) -> None:
+        fid = int(frame_id)
+        with self.lock:
+            self._lidar_tf_cache.clear()
+            for lidar in self.lidars:
+                if lidar and lidar.is_alive:
+                    self._lidar_tf_cache[(fid, int(lidar.id))] = lidar.get_transform()
+
+    def calibrate_matrix_apply_mode_once(self) -> None:
+        """Détermine une fois la convention d'application des matrices CARLA.
+
+        On compare le résultat de carla.Transform.transform(Location) avec 4 façons
+        d'appliquer get_matrix() via numpy. Ça élimine l'heuristique ROI%.
+        """
+        if self._tf_apply_mode is not None:
+            return
+        try:
+            tf = carla.Transform(
+                carla.Location(x=10.0, y=-5.0, z=2.0),
+                carla.Rotation(pitch=12.0, yaw=37.0, roll=18.0),
+            )
+            M = np.array(tf.get_matrix(), dtype=np.float32)
+
+            rng = np.random.default_rng(12345)
+            pts = rng.normal(size=(64, 3)).astype(np.float32)
+            pts *= np.array([5.0, 5.0, 2.0], dtype=np.float32)
+            pts4 = np.ones((pts.shape[0], 4), dtype=np.float32)
+            pts4[:, :3] = pts
+
+            truth = []
+            for x, y, z in pts:
+                w = tf.transform(carla.Location(x=float(x), y=float(y), z=float(z)))
+                truth.append((w.x, w.y, w.z))
+            truth = np.array(truth, dtype=np.float32)
+
+            def pred(mode: str) -> np.ndarray:
+                if mode == "col":
+                    return (M @ pts4.T).T[:, :3]
+                if mode == "colT":
+                    return (M.T @ pts4.T).T[:, :3]
+                if mode == "row":
+                    return (pts4 @ M)[:, :3]
+                return (pts4 @ M.T)[:, :3]  # rowT
+
+            modes = ["col", "colT", "row", "rowT"]
+            errs = {}
+            for m in modes:
+                p = pred(m)
+                errs[m] = float(np.mean((p - truth) ** 2))
+
+            best = min(errs.items(), key=lambda kv: kv[1])[0]
+            with self.lock:
+                if self._tf_apply_mode is None:
+                    self._tf_apply_mode = best
+
+            try:
+                print(f"[TF CALIB] apply_mode={self._tf_apply_mode} mse={errs[self._tf_apply_mode]:.3e} all={errs}")
+            except Exception:
+                pass
+        except Exception:
+            # Fallback (ne doit jamais casser la capture)
+            with self.lock:
+                if self._tf_apply_mode is None:
+                    self._tf_apply_mode = "col"
+
+    def reset_lidar_frame_tracking(self) -> None:
+        with self.lock:
+            self._lidar_seen_sensor_ids.clear()
+            self._lidar_seen_frame = int(self.target_lidar_frame) if self.target_lidar_frame is not None else None
+            self._lidar_enqueued_sensor_ids.clear()
+            self._lidar_enqueued_frame = int(self._lidar_seen_frame) if self._lidar_seen_frame is not None else None
+
+    @staticmethod
+    def _try_bytes(buf) -> bytes:
+        try:
+            if isinstance(buf, (bytes, bytearray)):
+                return bytes(buf)
+            return bytes(memoryview(buf))
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _shallow_copy_pose(pose: Optional[dict]) -> Optional[dict]:
+        if pose is None:
+            return None
+        try:
+            return {
+                "location": dict(pose.get("location", {})),
+                "rotation": dict(pose.get("rotation", {})),
+            }
+        except Exception:
+            return None
+
+    def _drain_queue_nowait(self, q: Queue) -> int:
+        n = 0
+        try:
+            while True:
+                q.get_nowait()
+                q.task_done()
+                n += 1
+        except Exception:
+            pass
+        return n
+
+    def _enqueue_lidar_task(self, task) -> bool:
+        try:
+            self._lidar_q.put_nowait(task)
+            return True
+        except Exception:
+            return False
+
+    def _mark_lidar_seen(self, sensor_id: int, frame_id: int) -> None:
+        with self.lock:
+            if self._lidar_seen_frame is None:
+                return
+            if int(frame_id) != int(self._lidar_seen_frame):
+                return
+            self._lidar_seen_sensor_ids.add(int(sensor_id))
+
+    def wait_for_lidar_callbacks(self, timeout_s: float = 0.25, poll_s: float = 0.001) -> bool:
+        tgt = self.target_lidar_frame
+        if tgt is None:
+            return True
+
+        expected = self._expected_lidar_callbacks()
+        if expected <= 0:
+            return True
+
+        t0 = time.perf_counter()
+        while True:
+            with self.lock:
+                got = len(self._lidar_seen_sensor_ids) if self._lidar_seen_frame == int(tgt) else 0
+            if got >= expected:
+                return True
+            if (time.perf_counter() - t0) >= float(timeout_s):
+                return False
+            time.sleep(float(poll_s))
+
+    def start_new_accumulation(self, target_points: Optional[int] = None):
+        # ✅ epoch++ pour invalider callbacks retard
+        with self.lock:
+            self._accum_epoch += 1
+
+        # Purge best-effort des tâches LiDAR en attente (ancien epoch)
+        try:
+            self._drain_queue_nowait(self._lidar_q)
+        except Exception:
+            pass
+
+        with self.lock:
+            self._lidar_enqueued_sensor_ids.clear()
+            self._lidar_enqueued_frame = None
+
+        self.lidar_accumulator.reset(target_points or self.capture_points_target)
+
+        self.target_lidar_frame = None
+
+        # reset cam
+        for name in self.camera_received:
+            self.camera_received[name] = False
+            self.camera_pending[name] = False
+            self.camera_frame_id[name] = -1
+            self.camera_jpeg_frame_id[name] = -1
+            self.camera_jpeg[name] = None
+
     @staticmethod
     def _rpy_to_matrix(roll, pitch, yaw):
         cr, sr = np.cos(roll), np.sin(roll)
@@ -418,46 +768,259 @@ class PersistentSensorManager:
             [-sp, cp * sr, cp * cr]
         ], dtype=np.float32)
 
-    def _enqueue_image(self, cam_name: str, raw_bytes: bytes, w: int, h: int):
-        """
-        Enqueue non-bloquant : si la queue est pleine, on drop l'image
-        (mieux: perdre une frame que bloquer toute la sim).
+
+    def _enqueue_image(self, cam_name: str, raw_bytes: bytes, w: int, h: int, frame_id: int):
+        """Enqueue léger: pas de reshape/resize/encode dans le callback CARLA.
+
+        Important: sur Windows, envoyer de gros arrays à un ProcessPool est très lent
+        (pickle/copie). On reste en threads + OpenCV (qui libère le GIL) via _image_worker.
         """
         try:
-            self._img_q.put_nowait((cam_name, raw_bytes, w, h))
+            self._img_q.put_nowait((cam_name, raw_bytes, int(w), int(h), int(frame_id)))
         except Exception:
-            # Queue pleine -> drop
-            pass
-
+            # Queue pleine -> on drop (évite de bloquer le tick)
+            with self.lock:
+                self.camera_pending[cam_name] = False
+        
     def _image_worker(self):
-        """
-        Worker: raw BGRA -> BGR -> resize -> store (uint8) en 512x384
-        """
         while True:
-            cam_name, raw_bytes, w, h = self._img_q.get()
+            cam_name, raw_bytes, w, h, frame_id = self._img_q.get()
             try:
-                # raw BGRA (CARLA Raw)
-                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
-                arr = arr.reshape((h, w, 4))
-
-                # BGR (OpenCV) : slice view, resize fait la copie finale
+                t_worker_start = time.perf_counter()
+                
+                t0_arr = time.perf_counter()
+                arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((h, w, 4))
                 bgr = arr[:, :, :3]
+                dt_arr = time.perf_counter() - t0_arr
+                self.perf.add_callback('worker_array_reshape', dt_arr, cam_name)
+                
+                t0_resize = time.perf_counter()
+                small = cv2.resize(bgr, (self.cam_out_w, self.cam_out_h), interpolation=cv2.INTER_AREA)
+                dt_resize = time.perf_counter() - t0_resize
+                self.perf.add_callback('worker_resize', dt_resize, f'{cam_name}_{w}x{h}->{self.cam_out_w}x{self.cam_out_h}')
 
-                # Downsample haute qualité + rapide (AREA = bon pour réduire)
-                small = cv2.resize(
-                    bgr,
-                    (self.cam_out_w, self.cam_out_h),
-                    interpolation=cv2.INTER_AREA
-                )
-
-                # Store (petit, contiguous)
-                with self.lock:
-                    self.camera_data[cam_name] = small  # uint8 (H,W,3)
-                    self.camera_received[cam_name] = True
+                t0_encode = time.perf_counter()
+                ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+                dt_encode = time.perf_counter() - t0_encode
+                self.perf.add_callback('worker_jpeg_encode', dt_encode, cam_name)
+                
+                if ok:
+                    with self.lock:
+                        self.camera_jpeg[cam_name] = buf.tobytes()
+                        self.camera_jpeg_frame_id[cam_name] = int(frame_id)
+                        self.camera_pending[cam_name] = False
+                else:
+                    with self.lock:
+                        self.camera_pending[cam_name] = False
+                
+                dt_worker_total = time.perf_counter() - t_worker_start
+                self.perf.add_callback('worker_total', dt_worker_total, cam_name)
             except Exception:
-                pass
+                with self.lock:
+                    if cam_name in self.camera_pending:
+                        self.camera_pending[cam_name] = False
             finally:
                 self._img_q.task_done()
+
+
+    def _to_robot_frame_cached(self,
+                              pts_local: np.ndarray,
+                              M_sw: np.ndarray,
+                              M_wr: np.ndarray,
+                              bank_offset_world: Tuple[float, float, float],
+                              dbg_frame: int = -1) -> np.ndarray:
+        if pts_local is None or pts_local.size == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        # world -> robot(T0) (déjà figé au moment où T0 est fixé)
+        if M_wr is None:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        pts4 = np.ones((pts_local.shape[0], 4), dtype=np.float32)
+        pts4[:, :3] = pts_local.astype(np.float32, copy=False)
+
+        # Applique une matrice 4x4 selon la convention CARLA calibrée.
+        # On applique SEQUENTIELLEMENT:
+        #   1) sensor -> world via M_sw
+        #   2) undo offset world (soustraction directe, indépendante de la convention)
+        #   3) world -> robot(T0) via M_wr
+        mode = self._tf_apply_mode or "col"
+
+        def _apply_mat(M: np.ndarray, pts4_in: np.ndarray) -> np.ndarray:
+            if mode == "row":
+                return pts4_in @ M
+            if mode == "rowT":
+                return pts4_in @ M.T
+            if mode == "colT":
+                return (M.T @ pts4_in.T).T
+            return (M @ pts4_in.T).T  # col
+
+        pts_world4 = _apply_mat(M_sw, pts4)
+        # undo global bank offset in WORLD (simple et robuste)
+        dxo, dyo, dzo = bank_offset_world
+        if dxo or dyo or dzo:
+            pts_world4[:, 0] -= float(dxo)
+            pts_world4[:, 1] -= float(dyo)
+            pts_world4[:, 2] -= float(dzo)
+
+        pts_robot4 = _apply_mat(M_wr, pts_world4)
+        pts_robot = pts_robot4[:, :3]
+
+        # Debug convention : version worker (utilise dbg_frame capturé)
+        if self.debug_lidar_transforms and self._dbg_tf_prints_left > 0:
+            try:
+                start_f = int(DEBUG_LIDAR_TRANSFORMS_START_FRAME)
+                cur_f = int(dbg_frame)
+                if cur_f != -1 and cur_f < start_f:
+                    return pts_robot
+
+                if self._dbg_tf_last_frame_printed is None or self._dbg_tf_last_frame_printed != int(cur_f):
+                    self._dbg_tf_last_frame_printed = int(cur_f)
+                    self._dbg_tf_prints_left -= 1
+
+                    n = int(pts4.shape[0])
+                    m = min(n, 2048)
+                    if n > m:
+                        idx = np.arange(m, dtype=np.int64)
+                        c_loc = pts_local[idx]
+                        pts4_s = pts4[idx]
+                    else:
+                        c_loc = pts_local
+                        pts4_s = pts4
+
+                    x_min_d, x_max_d = -16.0, 16.0
+                    y_min_d, y_max_d = -16.0, 16.0
+                    z_min_d, z_max_d = -2.0, 8.0
+
+                    def _roi_ratio(p3: np.ndarray) -> float:
+                        if p3.size == 0:
+                            return 0.0
+                        x = p3[:, 0]; y = p3[:, 1]; z = p3[:, 2]
+                        return float(((x >= x_min_d) & (x <= x_max_d) & (y >= y_min_d) & (y <= y_max_d) & (z >= z_min_d) & (z <= z_max_d)).mean())
+
+                    print("\n" + "=" * 70)
+                    print("[TF DBG] Robot-frame transform (sequential) [WORKER]")
+                    print(f"[TF DBG] frame={cur_f} sample={m}/{n} bank_offset_world={bank_offset_world} apply_mode={self._tf_apply_mode}")
+
+                    def _summ(name: str, p3: np.ndarray, roi: float):
+                        if p3.size == 0:
+                            print(f"[TF DBG] {name}: empty")
+                            return
+                        mn = p3.min(axis=0)
+                        mx = p3.max(axis=0)
+                        mu = p3.mean(axis=0)
+                        print(f"[TF DBG] {name}: roi={roi*100:.3f}% mean=({mu[0]:.2f},{mu[1]:.2f},{mu[2]:.2f}) x[{mn[0]:.1f},{mx[0]:.1f}] y[{mn[1]:.1f},{mx[1]:.1f}] z[{mn[2]:.1f},{mx[2]:.1f}]")
+
+                    # Stats uniquement sur le repère final (robot)
+                    c_robot = pts_robot[:m] if pts_robot.shape[0] >= m else pts_robot
+                    r_robot = _roi_ratio(c_robot)
+                    _summ("local", c_loc, 0.0)
+                    _summ("robot", c_robot, r_robot)
+                    print("=" * 70 + "\n")
+            except Exception:
+                pass
+
+        return pts_robot
+
+    def _lidar_worker(self):
+        dtype = np.dtype([
+            ('x', np.float32), ('y', np.float32), ('z', np.float32),
+            ('CosAngle', np.float32),
+            ('ObjIdx', np.uint32), ('ObjTag', np.uint32)
+        ])
+        while True:
+            task = self._lidar_q.get()
+            try:
+                (raw_bytes, fid, sensor_id, slot_id, cfg_index,
+                 epoch_task, M_sw, M_wr, bank_off, empty_k) = task
+
+                with self.lock:
+                    if int(epoch_task) != int(self._accum_epoch):
+                        continue
+
+                if not raw_bytes:
+                    self._mark_lidar_seen(sensor_id, fid)
+                    continue
+
+                arr = np.frombuffer(raw_bytes, dtype=dtype)
+                if len(arr) == 0:
+                    self._mark_lidar_seen(sensor_id, fid)
+                    continue
+
+                if M_wr is None:
+                    self._mark_lidar_seen(sensor_id, fid)
+                    continue
+
+                pts_local = np.column_stack([arr['x'], arr['y'], arr['z']]).astype(np.float32)
+                lbl_hits = arr['ObjTag'].astype(np.uint8)
+
+                pts_robot_hits = self._to_robot_frame_cached(pts_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
+
+                # EMPTY
+                pts_robot_empty = np.zeros((0, 3), dtype=np.float32)
+                lbl_empty = np.zeros((0,), dtype=np.uint8)
+                k = int(empty_k)
+                if k > 0:
+                    n_hits = len(pts_local)
+                    max_range_m = 16.0
+                    d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
+                    s_max = np.minimum(0.98, max_range_m / (d + 1e-6)).astype(np.float32)
+                    s_max = np.where(d <= max_range_m, np.float32(0.98), s_max)
+                    r = np.random.rand(n_hits, k).astype(np.float32)
+                    t = r * s_max[:, None]
+                    pts_empty_local = (pts_local[:, None, :] * t[..., None]).reshape(-1, 3)
+                    pts_robot_empty = self._to_robot_frame_cached(pts_empty_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
+                    lbl_empty = np.full((len(pts_robot_empty),), LIDAR_EMPTY_SENTINEL, dtype=np.uint8)
+
+                # UNKNOWN
+                pts_robot_unk = np.zeros((0, 3), dtype=np.float32)
+                lbl_unk = np.zeros((0,), dtype=np.uint8)
+                max_range_m = 16.0
+                d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
+                valid = (d > 1e-3) & (d < max_range_m - 1e-3)
+                if np.any(valid):
+                    d_v = d[valid]
+                    pts_hit_v = pts_local[valid]
+                    s_max = (max_range_m / d_v)
+                    s_min = 1.02
+                    s_hi = np.maximum(s_max, s_min + 1e-3)
+                    r = np.random.rand(s_hi.shape[0]).astype(np.float32)
+                    s = s_min + r * (s_hi - s_min)
+                    pts_unk_local = pts_hit_v * s[:, None]
+                    pts_robot_unk = self._to_robot_frame_cached(pts_unk_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
+                    lbl_unk = np.full((len(pts_robot_unk),), LIDAR_UNKNOWN_SENTINEL, dtype=np.uint8)
+
+                pts_concat = np.vstack([pts_robot_hits, pts_robot_empty, pts_robot_unk])
+                lbl_concat = np.hstack([lbl_hits, lbl_empty, lbl_unk])
+
+                if self.debug_lidar_transforms and self._dbg_tf_prints_left > 0:
+                    try:
+                        print(
+                            f"[TF DBG] lidar_worker frame={fid} sensor={int(sensor_id)} slot={slot_id} cfg={cfg_index} "
+                            f"hits={len(pts_robot_hits):,} empty={len(pts_robot_empty):,} unk={len(pts_robot_unk):,} empty_points_per_hit={k}"
+                        )
+                    except Exception:
+                        pass
+
+                with self.lock:
+                    if int(epoch_task) != int(self._accum_epoch):
+                        continue
+
+                self.lidar_accumulator.add(pts_concat, lbl_concat, tag=slot_id)
+                self._mark_lidar_seen(sensor_id, fid)
+
+            except Exception:
+                try:
+                    print("Erreur LiDAR worker:")
+                    traceback.print_exc()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    self._lidar_q.task_done()
+                except Exception:
+                    pass
+
 
 
 
@@ -494,12 +1057,89 @@ class PersistentSensorManager:
         # full chain: sensor -> world(true) -> robot(T0)
         M_sr = M_wr @ M_undo @ M_sw
 
-        # apply with column-vector convention using transpose trick
+        # Homogeneous points
         pts4 = np.ones((pts_local.shape[0], 4), dtype=np.float32)
         pts4[:, :3] = pts_local.astype(np.float32, copy=False)
 
-        pts_robot4 = (M_sr @ pts4.T).T   # colonne -> colonne
-        return pts_robot4[:, :3]
+        # Deux conventions possibles selon la convention des matrices retournées par CARLA.
+        # 1) colonne: p' = M * p
+        pts_robot4_col = (M_sr @ pts4.T).T
+        # 2) ligne:   p' = p * M   => équivalent numpy: pts4 @ M.T
+        pts_robot4_row = (pts4 @ M_sr.T)
+
+        # Debug ponctuel (capé) pour comprendre un éventuel problème de transpose
+        if self.debug_lidar_transforms and self._dbg_tf_prints_left > 0:
+            try:
+                start_f = int(DEBUG_LIDAR_TRANSFORMS_START_FRAME)
+                cur_f = int(self.target_lidar_frame or -1)
+                if cur_f != -1 and cur_f < start_f:
+                    return pts_robot4_col[:, :3]
+
+                # évite de spammer plusieurs fois le même frame
+                if self._dbg_tf_last_frame_printed is None or self._dbg_tf_last_frame_printed != int(self.target_lidar_frame or -1):
+                    self._dbg_tf_last_frame_printed = int(self.target_lidar_frame or -1)
+                    self._dbg_tf_prints_left -= 1
+
+                    # petit échantillon pour stats rapides
+                    n = int(pts4.shape[0])
+                    m = min(n, 2048)
+                    if n > m:
+                        idx = np.random.choice(n, size=m, replace=False)
+                        c_col = pts_robot4_col[idx, :3]
+                        c_row = pts_robot4_row[idx, :3]
+                        c_loc = pts_local[idx]
+                    else:
+                        c_col = pts_robot4_col[:, :3]
+                        c_row = pts_robot4_row[:, :3]
+                        c_loc = pts_local
+
+                    # ROI attendue (celle du dataset implicite)
+                    x_min_d, x_max_d = -16.0, 16.0
+                    y_min_d, y_max_d = -16.0, 16.0
+                    z_min_d, z_max_d = -2.0, 8.0
+
+                    def _roi_ratio(p3: np.ndarray) -> float:
+                        if p3.size == 0:
+                            return 0.0
+                        x = p3[:, 0]; y = p3[:, 1]; z = p3[:, 2]
+                        return float(((x >= x_min_d) & (x <= x_max_d) & (y >= y_min_d) & (y <= y_max_d) & (z >= z_min_d) & (z <= z_max_d)).mean())
+
+                    r_col = _roi_ratio(c_col)
+                    r_row = _roi_ratio(c_row)
+
+                    st_loc = getattr(sensor_transform, 'location', None)
+                    st_rot = getattr(sensor_transform, 'rotation', None)
+
+                    print("\n" + "=" * 70)
+                    print("[TF DBG] Compare conventions (col vs row/transposée)")
+                    print(f"[TF DBG] target_lidar_frame={self.target_lidar_frame} sample={m}/{n} bank_offset_world={self.bank_global_offset_world}")
+                    if st_loc is not None and st_rot is not None:
+                        print(f"[TF DBG] sensor_tf loc=({st_loc.x:.3f},{st_loc.y:.3f},{st_loc.z:.3f}) rot(p,y,r)=({st_rot.pitch:.2f},{st_rot.yaw:.2f},{st_rot.roll:.2f})")
+                    try:
+                        rr = self.reference_robot_transform
+                        print(f"[TF DBG] robot(T0) loc=({rr['location']['x']:.3f},{rr['location']['y']:.3f},{rr['location']['z']:.3f}) rot(p,y,r)=({rr['rotation']['pitch']:.2f},{rr['rotation']['yaw']:.2f},{rr['rotation']['roll']:.2f})")
+                    except Exception:
+                        pass
+
+                    def _summ(name: str, p3: np.ndarray, roi: float):
+                        if p3.size == 0:
+                            print(f"[TF DBG] {name}: empty")
+                            return
+                        mn = p3.min(axis=0)
+                        mx = p3.max(axis=0)
+                        mu = p3.mean(axis=0)
+                        print(f"[TF DBG] {name}: roi={roi*100:.3f}% mean=({mu[0]:.2f},{mu[1]:.2f},{mu[2]:.2f}) x[{mn[0]:.1f},{mx[0]:.1f}] y[{mn[1]:.1f},{mx[1]:.1f}] z[{mn[2]:.1f},{mx[2]:.1f}]")
+
+                    _summ("local", c_loc, 0.0)
+                    _summ("robot_col(M@p)", c_col, r_col)
+                    _summ("robot_row(p@M.T)", c_row, r_row)
+                    print("=" * 70 + "\n")
+            except Exception:
+                # debug doit jamais casser la capture
+                pass
+
+        # Convention utilisée (actuelle): colonne.
+        return pts_robot4_col[:, :3]
 
 
 
@@ -539,6 +1179,14 @@ class PersistentSensorManager:
     def set_reference_robot(self, position: dict):
         """Fixe le repère ROBOT T0 pour la frame courante."""
         self.reference_robot_transform = position
+        try:
+            robot_tf = carla.Transform(
+                carla.Location(**position["location"]),
+                carla.Rotation(**position["rotation"])
+            )
+            self.reference_robot_M_wr = np.array(robot_tf.get_inverse_matrix(), dtype=np.float32)
+        except Exception:
+            self.reference_robot_M_wr = None
 
     def cleanup_orphan_sensors(self):
         with SectionTimer(self.perf, "cleanup_orphan_sensors"):
@@ -634,7 +1282,6 @@ class PersistentSensorManager:
                     self.lidar_rigs = {}
                     self.lidars = []
 
-                    # On crée un rig par slot s dans [-N..N]
                     for s in self.lidar_slot_ids:
                         rig_list = []
 
@@ -648,11 +1295,14 @@ class PersistentSensorManager:
                             lidar_bp.set_attribute('lower_fov', str(cfg['lower_fov']))
                             lidar_bp.set_attribute('horizontal_fov', str(cfg['horizontal_fov']))
                             try:
+                                lidar_bp.set_attribute('sensor_tick', '0.0')
+                            except Exception:
+                                pass
+                            try:
                                 lidar_bp.set_attribute('role_name', 'virtual_sensor')
                             except Exception:
                                 pass
 
-                            # Spawn provisoire : on les met tous sur start_transform, on les bougera ensuite
                             tf = carla.Transform(
                                 start_transform.location + carla.Location(x=cfg['dx'], y=cfg['dy'], z=cfg['dz']),
                                 carla.Rotation()
@@ -664,66 +1314,77 @@ class PersistentSensorManager:
                             rig_list.append(lidar)
                             self.lidar_actor_to_slot[lidar.id] = int(s)
 
-                            # --- callback ---
+                            # ✅ CALLBACK PATCHÉ : transform cache + epoch guard
                             def make_cb(sensor, cfg_index=i, slot_id=int(s)):
                                 def _cb(data):
-                                    # si lidar désactivé (par hauteur) on ignore
                                     if not self.active_lidar_mask[cfg_index]:
                                         return
+
                                     try:
-                                        arr = np.frombuffer(data.raw_data, dtype=np.dtype([
-                                            ('x', np.float32), ('y', np.float32), ('z', np.float32),
-                                            ('CosAngle', np.float32),
-                                            ('ObjIdx', np.uint32), ('ObjTag', np.uint32)
-                                        ]))
-                                        if len(arr) == 0:
+                                        fid = int(getattr(data, 'frame', -1))
+                                        tgt_f = self.target_lidar_frame
+
+                                        # filtre frame strict si demandé
+                                        if tgt_f is not None and fid != int(tgt_f):
                                             return
 
-                                        pts_local = np.column_stack([arr['x'], arr['y'], arr['z']]).astype(np.float32)
-                                        sensor_tf = sensor.get_transform()
+                                        # ✅ epoch snapshot + anti-doublon (1 message / capteur / frame)
+                                        with self.lock:
+                                            epoch_now = int(self._accum_epoch)
 
-                                        # hits en repère robot (T0)
-                                        pts_robot_hits = self._to_robot_frame(pts_local, sensor_tf)
-                                        lbl_hits = arr['ObjTag'].astype(np.uint8)
+                                            if self._lidar_enqueued_frame is not None and int(fid) == int(self._lidar_enqueued_frame):
+                                                if int(sensor.id) in self._lidar_enqueued_sensor_ids:
+                                                    return
+                                            else:
+                                                self._lidar_enqueued_frame = int(fid)
+                                                self._lidar_enqueued_sensor_ids.clear()
 
-                                        # EMPTY avant hit
-                                        pts_robot_empty = np.zeros((0, 3), dtype=np.float32)
-                                        lbl_empty = np.zeros((0,), dtype=np.uint8)
+                                            self._lidar_enqueued_sensor_ids.add(int(sensor.id))
 
-                                        if self.empty_points_per_hit > 0:
-                                            n_hits = len(pts_local)
-                                            k = self.empty_points_per_hit
-                                            t = np.random.rand(n_hits, k).astype(np.float32) * 0.98
-                                            pts_empty_local = (pts_local[:, None, :] * t[..., None]).reshape(-1, 3)
-                                            pts_robot_empty = self._to_robot_frame(pts_empty_local, sensor_tf)
-                                            lbl_empty = np.full((len(pts_robot_empty),), LIDAR_EMPTY_SENTINEL, dtype=np.uint8)
+                                            # Snapshot du repère robot(T0) au moment où on accepte cette frame.
+                                            M_wr = None
+                                            if self.reference_robot_M_wr is not None:
+                                                M_wr = np.array(self.reference_robot_M_wr, copy=True)
+                                            bank_off = tuple(self.bank_global_offset_world)
+                                            empty_k = int(self.empty_points_per_hit)
 
-                                        # UNKNOWN derrière hit (optionnel)
-                                        pts_robot_unk = np.zeros((0, 3), dtype=np.float32)
-                                        lbl_unk = np.zeros((0,), dtype=np.uint8)
+                                        if M_wr is None:
+                                            with self.lock:
+                                                self._lidar_enqueued_sensor_ids.discard(int(sensor.id))
+                                            return
 
-                                        max_range_m = 16.0
-                                        d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
-                                        valid = (d > 1e-3) & (d < max_range_m - 1e-3)
-                                        if np.any(valid):
-                                            d_v = d[valid]
-                                            pts_hit_v = pts_local[valid]
-                                            s_max = (max_range_m / d_v)
-                                            s_min = 1.02
-                                            s_hi = np.maximum(s_max, s_min + 1e-3)
-                                            r = np.random.rand(s_hi.shape[0]).astype(np.float32)
-                                            s = s_min + r * (s_hi - s_min)
-                                            pts_unk_local = pts_hit_v * s[:, None]
-                                            pts_robot_unk = self._to_robot_frame(pts_unk_local, sensor_tf)
-                                            lbl_unk = np.full((len(pts_robot_unk),), LIDAR_UNKNOWN_SENTINEL, dtype=np.uint8)
+                                        # ✅ TRANSFORM ROBUSTE : on utilise la transform attendue (celle qu'on a set_transform)
+                                        # pour éliminer les oscillations dues à data.transform parfois stale.
+                                        with self.lock:
+                                            M_sw = self._lidar_expected_M_sw.get(int(sensor.id), None)
+                                        if M_sw is None:
+                                            # fallback (au cas où) : data.transform, puis cache.
+                                            sensor_tf = getattr(data, 'transform', None)
+                                            if sensor_tf is None:
+                                                with self.lock:
+                                                    if epoch_now != int(self._accum_epoch):
+                                                        return
+                                                    sensor_tf = self._lidar_tf_cache.get((fid, int(sensor.id)), None)
+                                            if sensor_tf is None:
+                                                with self.lock:
+                                                    self._lidar_enqueued_sensor_ids.discard(int(sensor.id))
+                                                return
+                                            try:
+                                                M_sw = np.array(sensor_tf.get_matrix(), dtype=np.float32)
+                                            except Exception:
+                                                with self.lock:
+                                                    self._lidar_enqueued_sensor_ids.discard(int(sensor.id))
+                                                return
 
-                                        pts_concat = np.vstack([pts_robot_hits, pts_robot_empty, pts_robot_unk])
-                                        lbl_concat = np.hstack([lbl_hits, lbl_empty, lbl_unk])
+                                        raw_bytes = self._try_bytes(getattr(data, 'raw_data', b""))
+                                        task = (raw_bytes, int(fid), int(sensor.id), int(slot_id), int(cfg_index),
+                                            int(epoch_now), M_sw, M_wr, bank_off, int(empty_k))
 
-                                        # tag = slot_id (pose relative à T0)
-                                        # (tu peux aussi stocker le vrai index j absolu ailleurs)
-                                        self.lidar_accumulator.add(pts_concat, lbl_concat, tag=slot_id)
-
+                                        ok = self._enqueue_lidar_task(task)
+                                        if not ok:
+                                            with self.lock:
+                                                self._lidar_enqueued_sensor_ids.discard(int(sensor.id))
+                                            return
                                     except Exception:
                                         print(f"Erreur LiDAR (id={sensor.id}):")
                                         traceback.print_exc()
@@ -786,19 +1447,60 @@ class PersistentSensorManager:
                         self.camera_data[cfg['name']] = None
                         self.camera_received[cfg['name']] = False
 
+
                         def make_cam_cb(name):
                             def _cb(image):
+                                t_cam_cb = time.perf_counter()
                                 try:
+                                    tgt = self.target_cam_frame
+                                    if tgt is None:
+                                        return
+
+                                    fid = int(image.frame)
+
+                                    # ✅ règle robuste : on accepte la 1ère image ">= tgt" (pas besoin de tolérance ±1)
+                                    # et on n’accepte qu’une seule fois par caméra pour cette pose
+                                    with self.lock:
+                                        if self.camera_received.get(name, False):
+                                            return
+                                        if self.camera_pending.get(name, False):
+                                            return
+                                        if fid < tgt:
+                                            return
+                                        # Marque "in-flight" pour éviter de ré-enqueue à chaque tick
+                                        self.camera_pending[name] = True
+
+                                        # IMPORTANT: on marque "reçu" dès maintenant (frame brute)
+                                        # pour ne pas reticker juste parce que l'encodage JPEG prend du temps.
+                                        self.camera_received[name] = True
+                                        self.camera_frame_id[name] = fid
+
+                                    # Convert seulement si on traite vraiment
                                     image.convert(carla.ColorConverter.Raw)
-                                    raw = bytes(image.raw_data)  # copie nécessaire: buffer CARLA volatile
-                                    self._enqueue_image(name, raw, image.width, image.height)
+
+                                    # enqueue seulement si potentiellement utile
+                                    t0_enqueue = time.perf_counter()
+                                    self._enqueue_image(name, image.raw_data, image.width, image.height, fid)
+                                    dt_enqueue = time.perf_counter() - t0_enqueue
+                                    self.perf.add_callback('camera_enqueue', dt_enqueue, name)
+                                    
+                                    dt_total_cam = time.perf_counter() - t_cam_cb
+                                    self.perf.add_callback('camera_callback_total', dt_total_cam, name)
+
                                 except Exception:
+                                    with self.lock:
+                                        if name in self.camera_pending:
+                                            self.camera_pending[name] = False
                                     pass
                             return _cb
 
-                        cam.listen(make_cam_cb(cfg['name']))
+                        cb = make_cam_cb(cfg['name'])
+                        self.camera_callbacks[cfg['name']] = cb
+                        cam.listen(cb)
 
                 self.sensors_created = True
+                # Calibre une fois la convention d'application des matrices CARLA.
+                self.calibrate_matrix_apply_mode_once()
                 print(f"✅ {len(self.lidars)} LiDARs et {len(self.cameras)} caméras créés")
                 for _ in range(1):
                     self.world.tick()
@@ -846,7 +1548,17 @@ class PersistentSensorManager:
                     yaw=ego_tf.rotation.yaw,
                     roll=ego_tf.rotation.roll
                 )
-                lidar.set_transform(carla.Transform(sensor_loc_world, sensor_rot_world))
+                new_tf = carla.Transform(sensor_loc_world, sensor_rot_world)
+                lidar.set_transform(new_tf)
+
+                # Cache la matrice attendue (sensor->world) pour ce capteur.
+                # Utilisée ensuite côté callback pour éviter les incohérences.
+                try:
+                    M_sw = np.array(new_tf.get_matrix(), dtype=np.float32)
+                    with self.lock:
+                        self._lidar_expected_M_sw[int(lidar.id)] = M_sw
+                except Exception:
+                    pass
 
     def _actors_near_any_lidar(self, min_dist: float = 1.0) -> bool:
         """
@@ -964,10 +1676,16 @@ class PersistentSensorManager:
             except Exception:
                 pass
 
-    def start_new_accumulation(self, target_points: Optional[int] = None):
-        self.lidar_accumulator.reset(target_points or self.capture_points_target)
-        for name in self.camera_received:
-            self.camera_received[name] = False
+    # def start_new_accumulation(self, target_points: Optional[int] = None):
+    #     self.lidar_accumulator.reset(target_points or self.capture_points_target)
+    #     # Par défaut on accepte toutes les frames LiDAR, le générateur peut fixer un target précis.
+    #     self.target_lidar_frame = None
+    #     for name in self.camera_received:
+    #         self.camera_received[name] = False
+    #         self.camera_pending[name] = False
+    #         self.camera_frame_id[name] = -1
+    #         self.camera_jpeg_frame_id[name] = -1
+    #         self.camera_jpeg[name] = None
 
     def capture_current_frame(self, weather_preset=None):
         with SectionTimer(self.perf, "accumulate_lidar_get"):
@@ -976,16 +1694,17 @@ class PersistentSensorManager:
             print(" ❌ Pas de points LiDAR")
             return None
         print(f" ✅ {len(points):,} points LiDAR (hits + empty) accumulés (repère ROBOT)")
-        images = {}
-        with SectionTimer(self.perf, "camera_copy_blur"):
-            with self.lock:
-                for name, img in self.camera_data.items():
-                    if img is not None:
-                        images[name] = img #self.apply_camera_blur(img.copy(), weather_preset)
+
+        # On ne bloque PAS ici sur l'encodage JPEG.
+        # Les JPEG seront attendus côté thread de sauvegarde (AsyncWriter), ce qui
+        # permet à la boucle principale de continuer à tick/accumuler.
+        with self.lock:
+            expected_cam_frames = dict(self.camera_frame_id)
         return {
             'points': points,
             'labels': labels,
-            'images': images,
+            'images': {},
+            'expected_cam_frames': expected_cam_frames,
             'scan_duration': 0.0,
             'ticks': 0
         }
@@ -1065,6 +1784,8 @@ class FastDatasetGenerator:
         voxel_keep_ratio_empty: float = 0.3,
         voxel_keep_ratio_unknown: float = 0.1,
         lidar_empty_points_per_hit: int = 2,
+        camera_stride: int = 1,
+        one_tick_per_pose: bool = False,
     ):
         
 
@@ -1129,6 +1850,11 @@ class FastDatasetGenerator:
         self.max_ticks_per_pose = int(max_ticks_per_pose)
         self.randomize_clear_poses = bool(randomize_clear_poses)
 
+        # Downsample temporel cam (1 pose sur N). Garde la résolution, réduit le coût de rendu.
+        self.camera_stride = max(1, int(camera_stride))
+        # Force strictement 1 tick par pose (cam + lidar sur le même tick)
+        self.one_tick_per_pose = bool(one_tick_per_pose)
+
         # occupancy implicite
         self.points_per_voxel_min = int(implicit_points_per_voxel_min)
         self.points_per_voxel_max = int(implicit_points_per_voxel_max)
@@ -1165,6 +1891,8 @@ class FastDatasetGenerator:
 
         # Thread de sauvegarde : 
         self.writer = AsyncWriter(self.save_frame)
+
+
 
         print("🤖 CONFIGURATION DATASET OCCUPANCY IMPLICITE (multi-poses)")
         print(f"  Carte: {self.map_name}")
@@ -1217,7 +1945,7 @@ class FastDatasetGenerator:
                     # 3. Configurer le Substepping pour garder une physique parfaite
                     settings.substepping = True
                     settings.max_substep_delta_time = 0.01
-                    settings.max_substeps = 50
+                    settings.max_substeps = 20
                     
                     self.world.apply_settings(settings)
 
@@ -1336,6 +2064,7 @@ class FastDatasetGenerator:
         pts_robot: np.ndarray,
         lbl_raw: np.ndarray,
         target_total_points: int,
+        debug_tag: str = "",
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Optimisations appliquées (focus sur tes timings):
@@ -1356,7 +2085,10 @@ class FastDatasetGenerator:
 
         def toc(t0, name):
             dt = time.perf_counter() - t0
-            print(f"[TIME] {name:<22s}: {dt:.4f}s")
+            prefix = f"[{debug_tag}] " if debug_tag else ""
+            print(f"{prefix}[TIME] {name:<22s}: {dt:.4f}s")
+
+        prefix = f"[{debug_tag}] " if debug_tag else ""
 
         t_global = tic()
 
@@ -1382,6 +2114,17 @@ class FastDatasetGenerator:
             (y >= y_min) & (y <= y_max) &
             (z >= z_min) & (z <= z_max)
         )
+        # Diagnostic léger pour comprendre les frames "quasi vides".
+        # (évite les gros prints quand tout va bien)
+        in_ratio = float(mask_in.mean())
+        if in_ratio < 0.05:
+            try:
+                print(
+                    f"{prefix}   [ROI dbg] in={in_ratio*100:.2f}% | "
+                    f"x[{x.min():.1f},{x.max():.1f}] y[{y.min():.1f},{y.max():.1f}] z[{z.min():.1f},{z.max():.1f}]"
+                )
+            except Exception:
+                pass
         if not np.any(mask_in):
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.uint8)
 
@@ -1616,7 +2359,7 @@ class FastDatasetGenerator:
         toc(t0_unk, "UNKNOWN loop (vect)")
 
         n_occ, n_emp, n_unk = points_occ.shape[0], points_empty.shape[0], points_unknown.shape[0]
-        print(f"   → Pools: occ={n_occ} pts, empty={n_emp} pts, unk={n_unk} pts (avant ratios)")
+        print(f"{prefix}   → Pools: occ={n_occ} pts, empty={n_emp} pts, unk={n_unk} pts (avant ratios)")
 
         # ---------------- ratios / target ----------------
         t0 = tic()
@@ -1649,7 +2392,7 @@ class FastDatasetGenerator:
         toc(t0, "final sampling+stack")
 
         print(
-            f"   → Points finals (occ/empty/unk): "
+            f"{prefix}   → Points finals (occ/empty/unk): "
             f"{pts_occ_s.shape[0]}/{pts_emp_s.shape[0]}/{pts_unk_s.shape[0]} "
             f"(total={pts_final.shape[0]:,} cible={target_total_points:,})"
         )
@@ -1667,151 +2410,68 @@ class FastDatasetGenerator:
 
     # ---------- SAVE FRAME ----------
 
-    def save_frame(self, frame_data: dict, frame_id: int, ref_position: dict):
-        
-        EMPTY_COLOR = (255, 255, 255)   # comme tu veux
-        UNKNOWN_COLOR = (128, 128, 128) # comme tu veux
-        
+    def save_frame(self, frame_data, frame_id, ref_pos):
+            fmt_id = f"{frame_id:06d}"
+            pts, lbl = frame_data['points'], frame_data['labels']
+            
+            # --- LIDAR/OCC (CPU Principal) ---
+            target_n = random.randint(self.points_min_saved, self.points_max_saved)
+            with SectionTimer(self.perf, "build_implicit_total"):
+                pts_f, lbl_f = self._build_implicit_from_points(pts, lbl, target_n, debug_tag=f"frame_{fmt_id}")
 
-        
-        import random
-        formatted_id = f"{frame_id:06d}"
+            # Sauvegarde points
+            np.savez(os.path.join(self.output_dir, "points", f"frame_{fmt_id}.npz"), points=pts_f.astype(np.float16), labels=lbl_f)
 
-        pts = frame_data['points']
-        lbl = frame_data['labels']
+            # --- IMAGES (threads) ---
+            # Les JPEG sont encodés en arrière-plan par PersistentSensorManager._image_worker.
+            # Ici (thread de sauvegarde), on attend brièvement qu'ils soient prêts.
+            expected = frame_data.get('expected_cam_frames', {})
+            if expected:
+                t0_wait = time.perf_counter()
+                timeout_s = 1.5
+                while True:
+                    with self.sensor_manager.lock:
+                        all_ready = True
+                        for cam_name, expected_fid in expected.items():
+                            if expected_fid < 0:
+                                continue
+                            if self.sensor_manager.camera_jpeg_frame_id.get(cam_name, -1) < expected_fid:
+                                all_ready = False
+                                break
+                    if all_ready:
+                        break
+                    if (time.perf_counter() - t0_wait) > timeout_s:
+                        break
+                    time.sleep(0.001)
 
-        # filtrage sémantique (uniquement sur les HITS, pas les empty sentinel)
-        # NOTE: lbl ici = ObjTag CARLA (uint8) + sentinel 255
-        if self.allowed_semantic_tags is not None:
-            mask_empty = (lbl == LIDAR_EMPTY_SENTINEL)
-            mask_hit = ~mask_empty
-            if np.any(mask_hit):
-                allowed = np.isin(lbl[mask_hit], np.array(self.allowed_semantic_tags, dtype=np.uint8))
-                keep_hit_idx = np.where(mask_hit)[0][allowed]
-            else:
-                keep_hit_idx = np.array([], dtype=np.int64)
+                with self.sensor_manager.lock:
+                    for cam_name, expected_fid in expected.items():
+                        if expected_fid < 0:
+                            continue
+                        if self.sensor_manager.camera_jpeg_frame_id.get(cam_name, -1) < expected_fid:
+                            continue
+                        jpg_bytes = self.sensor_manager.camera_jpeg.get(cam_name, None)
+                        if not jpg_bytes:
+                            continue
+                        path = os.path.join(self.output_dir, "images", f"frame_{fmt_id}_{cam_name}.jpg")
+                        self.sensor_manager.image_writer.q.put((path, jpg_bytes))
 
-            keep_idx = np.concatenate([keep_hit_idx, np.where(mask_empty)[0]])
-            keep_idx = np.unique(keep_idx)
-            pts = pts[keep_idx]
-            lbl = lbl[keep_idx]
-
-        # nombre total de points final (implicit)
-        target_total_points = random.randint(self.points_min_saved, self.points_max_saved)
-
-        with SectionTimer(self.perf, "build_implicit_grid"):
-            pts_final, lbl_final = self._build_implicit_from_points(
-                pts,
-                lbl,
-                target_total_points=target_total_points
-            )
-
-        print(f"   → implicit occupancy: {len(pts_final):,} pts (cible={target_total_points:,})")
-
-        # --- mapping complet: Empty/Unknown + 22 CARLA ---
-        class_names = np.array(
-            ["Empty", "Unknown"] + [name for (_id, name, _rgb) in CARLA_22],
-            dtype=object
-        )
-        class_ids = np.array(
-            [254, 253] + [int(_id) for (_id, _name, _rgb) in CARLA_22],
-            dtype=np.uint8
-        )
-        class_colors = np.array(
-            [EMPTY_COLOR, UNKNOWN_COLOR] + [tuple(_rgb) for (_id, _name, _rgb) in CARLA_22],
-            dtype=np.uint8
-        )  # shape (24,3)
-
-        # Sauvegarde NPZ
-        points_path = os.path.join(self.output_dir, "points", f"frame_{formatted_id}.npz")
-        with SectionTimer(self.perf, "save_points_npy"):
-            np.savez(
-                points_path,
-                points=pts_final.astype(np.float16),
-                labels=lbl_final.astype(np.uint8),   # IMPORTANT: -1/-2 possible
-                class_names=class_names,             # toujours 24 classes
-                class_ids=class_ids
-            )
-
-        # Sauvegarde des images
-        # Sauvegarde des images (encode en parallèle)
-        saved_images = 0
-        with SectionTimer(self.perf, "save_images_jpg"):
-            imgs = [(name, img) for name, img in frame_data['images'].items() if img is not None]
-
-            def _encode_and_write(name_img):
-                name, img = name_img
-                img_path = os.path.join(self.output_dir, "images", f"frame_{formatted_id}_{name}.jpg")
-
-                # encode en mémoire (souvent + rapide que imwrite direct)
-                ok, buf = cv2.imencode(
-                    ".jpg",
-                    img,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 95]  # 95 = quasi-lossless, bien plus rapide que 100
-                )
-                if ok:
-                    with open(img_path, "wb") as f:
-                        f.write(buf.tobytes())
-                    return 1
-                return 0
-
-            if imgs:
-                from concurrent.futures import ThreadPoolExecutor
-                n_workers = min(8, max(2, (os.cpu_count() or 8) // 2))
-                with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                    for r in ex.map(_encode_and_write, imgs):
-                        saved_images += int(r)
-
-        # PREVIEW dense (sur les points finals occupancy implicite)
-        preview_path = None
-        if self.preview_interval > 0 and (frame_id % self.preview_interval == 0):
-            preview_path = os.path.join(self.previews_dir, f"frame_{formatted_id}.jpg")
-            with SectionTimer(self.perf, "preview_render"):
-                self._render_preview(pts_final, lbl_final, frame_id, preview_path)
-            print(f"📸 Preview généré: {preview_path}")
-
-        meta = {
-            'frame_id': frame_id,
-            'timestamp': datetime.now().isoformat(),
-            'timestamp_sim': ref_position.get('timestamp_sim', None),
-            'num_points_saved': int(len(pts_final)),
-            'num_points_captured': int(len(frame_data['points'])),
-            'num_images': saved_images,
-            'scan_duration': frame_data.get('scan_duration', 0),
-            'ticks': frame_data.get('ticks', 0),
-            'position': ref_position,
-            'reference_frame': 'ROBOT_CENTERED',
-            'capture_mode': 'MULTI_EGO_ACCUM_ZSTACK_IMPLICIT_OCCUPANCY',
-            'voxel_config': {
-                'voxel_size': self.voxel_cfg.voxel_size,
-                'x_range': self.voxel_cfg.x_range,
-                'y_range': self.voxel_cfg.y_range,
-                'z_range': self.voxel_cfg.z_range,
-            },
-            'preview_jpeg': preview_path,
-            'weather_id': self.weather_id,
-            'weather_name': self.fixed_weather_name,
-            'points_path': points_path
-        }
-
-        meta_path = os.path.join(self.output_dir, "metadata", f"frame_{formatted_id}.json")
-        with SectionTimer(self.perf, "save_metadata_json"):
-            with open(meta_path, 'w') as f:
-                json.dump(meta, f, indent=2)
-
-        print(f" 💾 Frame {frame_id}: points={len(pts_final):,} "
-            f"| preview={os.path.basename(preview_path) if preview_path else '—'}")
+            # Metadata
+            with open(os.path.join(self.output_dir, "metadata", f"frame_{fmt_id}.json"), 'w') as f:
+                json.dump({'frame_id': frame_id, 'pos': ref_pos}, f)
 
 
     # ---------- MAIN LOOP ----------
+
+    # =========================
+    # 3) FastDatasetGenerator.generate : MÉTHODE COMPLÈTE À MODIFIER
+    #    -> Patch : target frame + cache transform + reset tracking
+    # =========================
 
     def generate(self, max_frames=1000):
         if not self.connect():
             return
 
-        # -----------------------------------------
-        # SENSOR MANAGER (avec window_back/fwd)
-        # -----------------------------------------
         self.sensor_manager = PersistentSensorManager(
             self.world,
             enable_blur=self.enable_blur,
@@ -1853,9 +2513,7 @@ class FastDatasetGenerator:
                     f"y={ref_position['location']['y']:.2f}"
                 )
 
-                # ------------------------------------------------
-                # Création capteurs une seule fois
-                # ------------------------------------------------
+                # create sensors
                 if pos_idx == 0:
                     start_transform = carla.Transform(
                         carla.Location(**ref_position['location']),
@@ -1865,108 +2523,132 @@ class FastDatasetGenerator:
                         print("❌ Impossible de créer les capteurs")
                         return
 
-                # ------------------------------------------------
-                # Repère robot T0
-                # ------------------------------------------------
-                self.sensor_manager.set_reference_robot(ref_position)
-                self.sensor_manager.move_cameras_to_position(ref_position)
-                
-                with self.sensor_manager.lock:
-                    for k in self.sensor_manager.camera_received:
-                        self.sensor_manager.camera_received[k] = False
+                # robot frame T0
+                with SectionTimer(self.perf, "move_cameras_to_position"):
+                    self.sensor_manager.set_reference_robot(ref_position)
+                    self.sensor_manager.move_cameras_to_position(ref_position)
 
-                # tick "de plus" (voire 2 ticks) pour laisser la cam produire une image fraîche
-                self.world.tick()
-                self.world.tick()
-                # attends la frame caméra (max 5 ticks)
-                for _ in range(20):
-                    with self.sensor_manager.lock:
-                        if all(self.sensor_manager.camera_received.values()):
-                            break
-                    self.world.tick()
-                
-                x0 = float(ref_position["location"]["x"])
-                y0 = float(ref_position["location"]["y"])
-                z0 = float(ref_position["location"]["z"])
+                do_capture_cam = (pos_idx % self.camera_stride == 0)
+                self.sensor_manager.set_cameras_active(do_capture_cam)
+
+                # build slot_to_pose
                 pitch0 = float(ref_position["rotation"].get("pitch", 0.0))
                 roll0  = float(ref_position["rotation"].get("roll", 0.0))
-                # ------------------------------------------------
-                # Construire mapping slot -> pose
-                # ------------------------------------------------
+
                 slot_to_pose = {}
                 for s in self.sensor_manager.lidar_slot_ids:
                     j = pos_idx + s
                     if j < 0 or j >= len(self.positions):
                         continue
-
                     pj = self.positions[j]
                     pose_j = {
                         "location": dict(pj["ego_location"]),
                         "rotation": dict(pj["ego_rotation"]),
                         "timestamp_sim": pj["timestamp_sim"],
                     }
-                    pose_j["location"]["x"] = x0
-                    pose_j["location"]["y"] = y0
-                    pose_j["location"]["z"] = z0
+                    # IMPORTANT: ne pas forcer la translation à T0 tout en gardant un yaw différent,
+                    # sinon on crée plusieurs repères (nuage en étoile autour de l'origine).
+                    # On garde la vraie translation de la pose j, et on ramène tout dans le repère T0 via M_wr.
                     pose_j["rotation"]["pitch"] = pitch0
                     pose_j["rotation"]["roll"]  = roll0
-
                     slot_to_pose[int(s)] = pose_j
+
                 print(f"🧭 rigs actifs: {len(slot_to_pose)}")
 
-                # ------------------------------------------------
-                # Placement initial de tout le bank
-                # ------------------------------------------------
-                self.sensor_manager.move_all_lidar_rigs(
-                    slot_to_pose,
-                    global_offset_world=(0.0, 0.0, 0.0)
-                )
+                with SectionTimer(self.perf, "move_all_lidar_rigs_initial"):
+                    self.sensor_manager.move_all_lidar_rigs(slot_to_pose, global_offset_world=(0.0, 0.0, 0.0))
 
-                # ------------------------------------------------
-                # Offset global si proximité actors
-                # ------------------------------------------------
-                dx, dy, dz = self.sensor_manager.find_safe_global_offset(
-                    slot_to_pose,
-                    min_dist=1.0,
-                    max_tries=15,
-                    xy_radius=2.0,
-                    z_offset=0.5
-                )
+                if self.one_tick_per_pose:
+                    dx, dy, dz = (0.0, 0.0, 0.0)
+                else:
+                    with SectionTimer(self.perf, "find_safe_global_offset"):
+                        dx, dy, dz = self.sensor_manager.find_safe_global_offset(
+                            slot_to_pose, min_dist=1.0, max_tries=15, xy_radius=2.0, z_offset=0.5
+                        )
 
                 if abs(dx) + abs(dy) + abs(dz) > 0.0:
                     print(f"↔️ global transpose lidar bank: dx={dx:.2f} dy={dy:.2f} dz={dz:.2f}")
 
-                self.sensor_manager.move_all_lidar_rigs(
-                    slot_to_pose,
-                    global_offset_world=(dx, dy, dz)
-                )
+                with SectionTimer(self.perf, "move_all_lidar_rigs_final"):
+                    self.sensor_manager.move_all_lidar_rigs(slot_to_pose, global_offset_world=(dx, dy, dz))
 
-                # ------------------------------------------------
-                # Randomize params sur tout le bank
-                # ------------------------------------------------
                 if self.randomize_clear_poses:
-                    self.sensor_manager.randomize_all_lidars_params()
+                    with SectionTimer(self.perf, "randomize_all_lidars_params"):
+                        self.sensor_manager.randomize_all_lidars_params()
 
-                # ------------------------------------------------
-                # ACCUMULATION SIMULTANÉE
-                # ------------------------------------------------
+                # ✅ start new accumulation (epoch++)
                 self.sensor_manager.start_new_accumulation(self.capture_points_target)
+
+                # ✅ On vise la prochaine frame
+                try:
+                    snap = self.world.get_snapshot()
+                    fid_next = int(snap.frame) + 1
+                except Exception:
+                    fid_next = None
+
+                if self.one_tick_per_pose and fid_next is not None:
+                    self.sensor_manager.target_lidar_frame = fid_next
+                else:
+                    self.sensor_manager.target_lidar_frame = None
+
+                self.sensor_manager.reset_lidar_frame_tracking()
+
+                # ✅ cache des transforms pour la frame cible (CRITIQUE)
+                if self.sensor_manager.target_lidar_frame is not None:
+                    self.sensor_manager.cache_lidar_transforms_for_frame(self.sensor_manager.target_lidar_frame)
+
+                # camera target
+                if do_capture_cam and fid_next is not None:
+                    self.sensor_manager.target_cam_frame = fid_next
+                else:
+                    self.sensor_manager.target_cam_frame = None
 
                 ticks_done = 0
 
-                while (
-                    not self.sensor_manager.lidar_accumulator.is_complete()
-                    and ticks_done < self.max_ticks_per_pose
-                ):
-                    self.world.tick()
-                    ticks_done += 1
+                with SectionTimer(self.perf, "lidar_accumulation_ticks"):
+                    if self.one_tick_per_pose:
+                        self.world.tick()
+                        ticks_done = 1
+                    else:
+                        while (not self.sensor_manager.lidar_accumulator.is_complete()
+                            and ticks_done < self.max_ticks_per_pose):
+                            self.world.tick()
+                            ticks_done += 1
+
+                # ✅ wait callbacks lidar (important)
+                ok_lidar = True
+                if self.sensor_manager.target_lidar_frame is not None:
+                    ok_lidar = self.sensor_manager.wait_for_lidar_callbacks(timeout_s=3.0, poll_s=0.001)
+                    if not ok_lidar:
+                        exp = self.sensor_manager._expected_lidar_callbacks()
+                        with self.sensor_manager.lock:
+                            got = len(self.sensor_manager._lidar_seen_sensor_ids)
+                            tgt = self.sensor_manager._lidar_seen_frame
+                        print(f"⚠️ LiDAR callbacks incomplètes pour frame={tgt} ({got}/{exp})")
+
+                # camera wait (inchangé)
+                if do_capture_cam:
+                    t0_cam_wait = time.perf_counter()
+                    while True:
+                        with self.sensor_manager.lock:
+                            ok_all = all(self.sensor_manager.camera_received.values())
+                        if ok_all:
+                            break
+                        if (time.perf_counter() - t0_cam_wait) > 0.2:
+                            break
+                        time.sleep(0.001)
 
                 print(f"⏱ ticks accumulation: {ticks_done}")
 
-                # ------------------------------------------------
-                # Récupération données
-                # ------------------------------------------------
-                frame_data = self.sensor_manager.capture_current_frame(self.fixed_weather_name)
+                # Barrière stricte en mode 1 tick/pose : si on n'a pas toutes les callbacks
+                # du frame cible, on SKIP la frame (sinon dataset instable / ROI quasi vide).
+                # On ne retick pas : on reste conforme à 1 tick par pose.
+                if self.one_tick_per_pose and (self.sensor_manager.target_lidar_frame is not None) and (not ok_lidar):
+                    print("⚠️ Skip frame: callbacks LiDAR incomplètes (mode 1 tick/pose)")
+                    continue
+
+                with SectionTimer(self.perf, "capture_current_frame"):
+                    frame_data = self.sensor_manager.capture_current_frame(self.fixed_weather_name)
 
                 counts = self.sensor_manager.lidar_accumulator.get_tag_counts()
                 items = sorted(counts.items(), key=lambda x: x[0])
@@ -1978,26 +2660,19 @@ class FastDatasetGenerator:
 
                 if frame_data and len(frame_data['points']) > 0:
                     unique_frame_id = self.global_frame_counter
-
                     with SectionTimer(self.perf, "save_frame_total"):
                         self.writer.queue.put((frame_data, unique_frame_id, ref_position))
-
                     self.global_frame_counter += 1
-
                     del frame_data
                     gc.collect()
                 else:
                     print("⚠️ Pas de points LiDAR pour cette frame")
 
-                # ------------------------------------------------
-                # LOG PROGRESSION
-                # ------------------------------------------------
                 if position_count % 5 == 0:
                     elapsed = time.time() - start_time
                     fps = self.global_frame_counter / elapsed if elapsed > 0 else 0
                     remaining = max_frames - position_count
                     eta = remaining / fps if fps > 0 else 0
-
                     print(
                         f"{'='*50}"
                         f" PROGRESSION {position_count}/{max_frames}"
@@ -2009,25 +2684,19 @@ class FastDatasetGenerator:
 
         except KeyboardInterrupt:
             print("⚠️ Interruption utilisateur")
-
         except Exception as e:
             print(f"❌ Erreur génération: {e}")
             traceback.print_exc()
-
         finally:
             print("🧹 Nettoyage final...")
             if self.sensor_manager:
                 self.sensor_manager.cleanup()
-
             self._deep_cleanup_world()
-
             try:
                 self.weather_manager.apply_by_id(0)
             except Exception:
                 pass
-
             total_time = time.time() - start_time
-
             print(
                 f"{'='*60}\n"
                 f"✅ GÉNÉRATION TERMINÉE\n"
@@ -2035,8 +2704,8 @@ class FastDatasetGenerator:
                 f"Temps total: {total_time/60:.1f} min\n"
                 f"{'='*60}"
             )
-
             self.perf.global_report()
+
 
 
 # ==========================
@@ -2062,7 +2731,7 @@ def main():
     parser.add_argument('--v-upper', type=float, default=60.0, help='FOV vertical haut (deg)')
     parser.add_argument('--v-lower', type=float, default=-60.0, help='FOV vertical bas (deg)')
     parser.add_argument('--lidar-channels', type=int, default=700, help='Canaux LiDAR')
-    parser.add_argument('--lidar-pps', type=int, default=500_000, help='Points/seconde LiDAR')
+    parser.add_argument('--lidar-pps', type=int, default=1_000_000, help='Points/seconde LiDAR')
     parser.add_argument('--lidar-range', type=float, default=150, help='Portée LiDAR (m)')
 
     parser.add_argument('--map', type=str, default='Town10HD_Opt', help='Carte CARLA')
@@ -2099,12 +2768,18 @@ def main():
     parser.add_argument('--no-randomize-clear', action='store_true',
                         help='Ne pas randomizer les LiDAR sur les poses “clear”')
 
+    # Cam / ticks perf
+    parser.add_argument('--camera-stride', type=int, default=1,
+                        help='Capture cam 1 pose sur N (résolution inchangée)')
+    parser.add_argument('--one-tick-per-pose', default=True, action='store_true',
+                        help='Mode rapide: cam seulement sur le 1er tick, puis accumulation LiDAR sans cam (attend quand même le quota de points)')
+
     # occupancy implicite
     parser.add_argument('--implicit-voxel-size', type=float, default=0.5,
                         help="Taille des voxels occupancy implicite (m)")
-    parser.add_argument('--implicit-points-per-voxel-min', type=int, default=1,
+    parser.add_argument('--implicit-points-per-voxel-min', type=int, default=2,
                         help="Nb min de points par voxel")
-    parser.add_argument('--implicit-points-per-voxel-max', type=int, default=3,
+    parser.add_argument('--implicit-points-per-voxel-max', type=int, default=4,
                         help="Nb max de points par voxel")
     parser.add_argument('--implicit-ratio-occ', type=float, default=0.8,
                         help="Ratio approx de points occupés dans le dataset implicite")
@@ -2176,6 +2851,8 @@ def main():
         voxel_keep_ratio_empty=args.voxel_keep_ratio_empty,
         voxel_keep_ratio_unknown=args.voxel_keep_ratio_unknown,
         lidar_empty_points_per_hit=args.implicit_empty_points_per_hit,
+        camera_stride=args.camera_stride,
+        one_tick_per_pose=args.one_tick_per_pose,
     )
     generator.generate(max_frames=args.frames)
 
