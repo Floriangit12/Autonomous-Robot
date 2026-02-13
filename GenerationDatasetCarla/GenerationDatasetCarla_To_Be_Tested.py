@@ -1632,7 +1632,7 @@ class PersistentSensorManager:
         loc_jitter_y=(-0.2, 0.2),
         loc_jitter_z=(-0.2, 0.2),
         pitch_jitter=(-5.0, 5.0),
-        yaw_jitter=(-10.0, 15.0),
+        yaw_jitter=(-45.0, 45.0),
         roll_jitter=(-5.0, 5.0),
         channels_range=(512, 1024),
         upper_fov=(40.0, 60.0),
