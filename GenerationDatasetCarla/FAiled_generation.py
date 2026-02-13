@@ -275,56 +275,82 @@ class LidarAccumulatorUntilTarget:
     def __init__(self, target_points=20_000_000):
         self.lock = threading.Lock()
         self.target_points = int(target_points)
-        self.points: List[np.ndarray] = []
-        self.labels: List[np.ndarray] = []
-        self.total_points = 0
+        # Allocation avec marge
+        # On alloue un buffer unique pour éviter la fragmentation et le vstack final
+        self._capacity = int(self.target_points * 1.2)
+        self._pts_buffer = np.empty((self._capacity, 3), dtype=np.float32)
+        self._lbl_buffer = np.empty((self._capacity,), dtype=np.uint8)
+        self._cursor = 0
+        self.counts_by_tag = defaultdict(int)
 
     def reset(self, target_points=None):
         with self.lock:
-            self.points.clear()
-            self.labels.clear()
-            self.total_points = 0
-            if hasattr(self, "counts_by_tag"):
-                self.counts_by_tag.clear()
-            if target_points is not None:
-                self.target_points = int(target_points)
+            self._cursor = 0
+            self.counts_by_tag.clear()
             
+            if target_points is not None:
+                new_target = int(target_points)
+                if new_target != self.target_points:
+                    self.target_points = new_target
+                    # Realloc intelligente si besoin
+                    needed = int(new_target * 1.2)
+                    if needed > self._capacity: # Grow
+                        # print(f"[Accumulator] Growing buffer: {self._capacity} -> {needed}")
+                        self._capacity = needed
+                        self._pts_buffer = np.empty((self._capacity, 3), dtype=np.float32)
+                        self._lbl_buffer = np.empty((self._capacity,), dtype=np.uint8)
+                    # On garde le buffer s'il est un peu trop grand (évite le churn)
+
     def get_tag_counts(self):
         with self.lock:
-            if hasattr(self, "counts_by_tag"):
-                return dict(self.counts_by_tag)
-            return {}
+            return dict(self.counts_by_tag)
     
     def add(self, pts, lbls, tag=None):
+        n = pts.shape[0]
+        if n == 0:
+            return
+
         with self.lock:
-            if pts.dtype != np.float32:
-                pts = pts.astype(np.float32, copy=False)
-            if lbls.dtype != np.uint8:
-                lbls = lbls.astype(np.uint8, copy=False)
+            # Check capacity overflow
+            if self._cursor + n > self._capacity:
+                # Double capacity
+                new_cap = max(int(self._capacity * 1.5), self._cursor + n + 100000)
+                # print(f"[Accumulator] Overflow resize: {self._capacity} -> {new_cap}")
+                new_pts = np.empty((new_cap, 3), dtype=np.float32)
+                new_lbl = np.empty((new_cap,), dtype=np.uint8)
+                
+                # Copy old content
+                new_pts[:self._cursor] = self._pts_buffer[:self._cursor]
+                new_lbl[:self._cursor] = self._lbl_buffer[:self._cursor]
+                
+                self._pts_buffer = new_pts
+                self._lbl_buffer = new_lbl
+                self._capacity = new_cap
             
-            # Avoid copy if possible, append view/ref
-            self.points.append(pts)
-            self.labels.append(lbls)
-            self.total_points += len(pts)
+            # Direct insert (Zero copy from `get` perspective later)
+            self._pts_buffer[self._cursor : self._cursor + n] = pts
+            self._lbl_buffer[self._cursor : self._cursor + n] = lbls
+            self._cursor += n
 
             if tag is not None:
-                if not hasattr(self, "counts_by_tag"):
-                    self.counts_by_tag = defaultdict(int)
-                self.counts_by_tag[int(tag)] += len(pts)
+                self.counts_by_tag[int(tag)] += n
 
     def is_complete(self):
         with self.lock:
-            return self.total_points >= self.target_points
+            return self._cursor >= self.target_points
 
     def get(self):
         with self.lock:
-            if not self.points:
+            if self._cursor == 0:
                 return None, None
-            pts = np.vstack(self.points)
-            lbls = np.hstack(self.labels)
-            self.points.clear()
-            self.labels.clear()
-            return pts, lbls
+            
+            # Return a COPY of the slice.
+            # This is one big copy, much better than vstack(thousands of arrays).
+            # We must copy because we reuse the internal buffer for the next frame.
+            pts_out = self._pts_buffer[:self._cursor].copy()
+            lbl_out = self._lbl_buffer[:self._cursor].copy()
+            
+            return pts_out, lbl_out
 
 
 # ==========================
@@ -1061,20 +1087,46 @@ class PersistentSensorManager:
                    lbl_empty = np.full((len(pts_robot_empty),), LIDAR_EMPTY_SENTINEL, dtype=np.uint8)
 
 
-                # UNKNOWN: SUPPRIMÉ car sémantiquement faux et coûteux (comme demandé point 4)
-                # "pts_robot_unk" générait des points derrière les hits.
-                # La vraie définition "Unknown" est "voxel vide jamais observé".
+                # UNKNOWN: Optimised but restored per user request
                 pts_robot_unk = np.zeros((0, 3), dtype=np.float32)
                 lbl_unk = np.zeros((0,), dtype=np.uint8)
+                
+                # Compute distance (re-use if available, here we compute)
+                d = np.linalg.norm(pts_local, axis=1)
+                max_range_m = 24.0
+                
+                valid_mask = (d > 1e-3) & (d < (max_range_m - 0.5))
+                count_unk = np.count_nonzero(valid_mask)
+                
+                if count_unk > 0:
+                   pts_v = pts_local[valid_mask]
+                   d_v = d[valid_mask]
+                   
+                   # Logic: sample uniformly between [1.02*dist, max_range]
+                   # clamp max range to avoid huge values if d is very small, though d>1e-3
+                   s_min = 1.02
+                   s_hi_raw = (max_range_m / (d_v + 1e-6))
+                   s_hi = np.maximum(s_hi_raw, s_min + 1e-3)
+                   
+                   # Vectorized random scaling (1 point per hit)
+                   r = np.random.rand(count_unk).astype(np.float32)
+                   s_val = s_min + r * (s_hi - s_min)
+                   
+                   # Scale local points
+                   pts_unk_local = pts_v * s_val[:, None]
+                   
+                   # Transform
+                   pts_robot_unk = self._to_robot_frame_cached(pts_unk_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
+                   lbl_unk = np.full((pts_robot_unk.shape[0],), LIDAR_UNKNOWN_SENTINEL, dtype=np.uint8)
 
-                pts_concat = np.vstack([pts_robot_hits, pts_robot_empty])
-                lbl_concat = np.hstack([lbl_hits, lbl_empty])
+                pts_concat = np.vstack([pts_robot_hits, pts_robot_empty, pts_robot_unk])
+                lbl_concat = np.hstack([lbl_hits, lbl_empty, lbl_unk])
 
                 if self.debug_lidar_transforms and self._dbg_tf_prints_left > 0:
                     try:
                         print(
                             f"[TF DBG] lidar_worker frame={fid} sensor={int(sensor_id)} slot={slot_id} cfg={cfg_index} "
-                            f"hits={len(pts_robot_hits):,} empty={len(pts_robot_empty):,}" # unk removed
+                            f"hits={len(pts_robot_hits):,} empty={len(pts_robot_empty):,} unk={len(pts_robot_unk):,}"
                         )
                     except Exception:
                         pass
