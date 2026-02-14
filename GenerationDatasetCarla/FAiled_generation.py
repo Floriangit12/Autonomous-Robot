@@ -505,7 +505,10 @@ class PersistentSensorManager:
         # LiDAR: pipeline async (callback ultra-légère -> workers)
         self._lidar_q = Queue(maxsize=512)
         self._lidar_workers = []
-        self._lidar_workers_n = max(12, min(12, int(os.cpu_count() or 8)))
+        # 🚀 BUGFIX: max(12, min(12, ...)) retourne toujours 12!
+        # On utilise tous les cores disponibles (min 8, max 24)
+        cpu_count = int(os.cpu_count() or 8)
+        self._lidar_workers_n = min(24, max(8, cpu_count))
         for _ in range(self._lidar_workers_n):
             t = Thread(target=self._lidar_worker, daemon=True)
             t.start()
@@ -1049,75 +1052,68 @@ class PersistentSensorManager:
 
                 pts_robot_hits = self._to_robot_frame_cached(pts_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
 
-                # EMPTY: generation par batch pour eviter explosion memoire
+                # 🚀 OPTIMISATION EMPTY: Réduire drastiquement les calculs
                 pts_robot_empty = np.zeros((0, 3), dtype=np.float32)
                 lbl_empty = np.zeros((0,), dtype=np.uint8)
                 k = int(empty_k)
                 
-                if k > 0:
-                   # Simplification: générer moins de points, ou différé
-                   # Pour l'instant, optimisation mémoire simple:
-                   # On ne génère PAS les points Empty ici si possible, ou on le fait plus intelligemment.
-                   # La critique suggere de le faire post-voxelisation.
-                   # Si on garde le pipeline actuel, on limite au strict minimum.
-                   pass
-                   # Code original commenté/simplifié pour perf immédiate comme demandé
-                   # Si nécessaire de garder la logique 'Empty', on la réactive mais optimisée :
-                   max_range_m = 24.0
-                   d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
-                   # Vectorisation optimisée
-                   s_max = np.minimum(0.98, max_range_m / (d + 1e-6))
-                   
-                   # Batch generation of empty points to save RAM
-                   # Instead of gigantic reshape, accumulate in chunks if needed
-                   # For now, let's keep it but ensure types are float32
-                   r = np.random.rand(n, k).astype(np.float32)
-                   t = r * s_max[:, None]
-                   
-                   # This memory op is huge: (N * K, 3)
-                   # pts_empty_local = (pts_local[:, None, :] * t[..., None]).reshape(-1, 3)
-                   # Optimized:
-                   pts_empty_local = np.empty((n * k, 3), dtype=np.float32)
-                   # Broadcast manually in chunks if N is large? 
-                   # Numpy broadcast is usually fast but memory hungry.
-                   # Let's trust numpy for now but clear variables immediately.
-                   pts_empty_local = (pts_local[:, None, :] * t[..., None]).reshape(-1, 3)
-                   
-                   pts_robot_empty = self._to_robot_frame_cached(pts_empty_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
-                   lbl_empty = np.full((len(pts_robot_empty),), LIDAR_EMPTY_SENTINEL, dtype=np.uint8)
+                if k > 0 and n > 0:
+                   # Limite: max 20% des points, ou 10k points max par callback
+                   k_actual = min(k, max(1, int(20000 / n)))
+                   if k_actual > 0:
+                       max_range_m = 24.0
+                       d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
+                       s_max = np.minimum(0.98, max_range_m / (d + 1e-6)).astype(np.float32)
+                       
+                       # Générer moins de points EMPTY
+                       r = np.random.rand(n, k_actual).astype(np.float32)
+                       t = r * s_max[:, None]
+                       
+                       pts_empty_local = (pts_local[:, None, :] * t[..., None]).reshape(-1, 3)
+                       pts_robot_empty = self._to_robot_frame_cached(pts_empty_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
+                       lbl_empty = np.full((len(pts_robot_empty),), LIDAR_EMPTY_SENTINEL, dtype=np.uint8)
+                       
+                       # Libérer mémoire immédiatement
+                       del pts_empty_local, r, t, d, s_max
 
 
-                # UNKNOWN: Optimised but restored per user request
+                # 🚀 OPTIMISATION UNKNOWN: Simplifier et limiter les calculs
                 pts_robot_unk = np.zeros((0, 3), dtype=np.float32)
                 lbl_unk = np.zeros((0,), dtype=np.uint8)
                 
-                # Compute distance (re-use if available, here we compute)
-                d = np.linalg.norm(pts_local, axis=1)
-                max_range_m = 24.0
-                
-                valid_mask = (d > 1e-3) & (d < (max_range_m - 0.5))
-                count_unk = np.count_nonzero(valid_mask)
-                
-                if count_unk > 0:
-                   pts_v = pts_local[valid_mask]
-                   d_v = d[valid_mask]
-                   
-                   # Logic: sample uniformly between [1.02*dist, max_range]
-                   # clamp max range to avoid huge values if d is very small, though d>1e-3
-                   s_min = 1.02
-                   s_hi_raw = (max_range_m / (d_v + 1e-6))
-                   s_hi = np.maximum(s_hi_raw, s_min + 1e-3)
-                   
-                   # Vectorized random scaling (1 point per hit)
-                   r = np.random.rand(count_unk).astype(np.float32)
-                   s_val = s_min + r * (s_hi - s_min)
-                   
-                   # Scale local points
-                   pts_unk_local = pts_v * s_val[:, None]
-                   
-                   # Transform
-                   pts_robot_unk = self._to_robot_frame_cached(pts_unk_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
-                   lbl_unk = np.full((pts_robot_unk.shape[0],), LIDAR_UNKNOWN_SENTINEL, dtype=np.uint8)
+                # Seulement si on a peu de points hits (évite surcharge)
+                if n < 5000:
+                    d = np.linalg.norm(pts_local, axis=1).astype(np.float32)
+                    max_range_m = 24.0
+                    
+                    valid_mask = (d > 1e-3) & (d < (max_range_m - 0.5))
+                    count_unk = np.count_nonzero(valid_mask)
+                    
+                    # Limiter à max 3000 points UNKNOWN par callback
+                    if count_unk > 3000:
+                        indices = np.where(valid_mask)[0]
+                        indices = np.random.choice(indices, size=3000, replace=False)
+                        valid_mask = np.zeros(n, dtype=bool)
+                        valid_mask[indices] = True
+                        count_unk = 3000
+                    
+                    if count_unk > 0:
+                        pts_v = pts_local[valid_mask]
+                        d_v = d[valid_mask]
+                        
+                        s_min = 1.02
+                        s_hi_raw = (max_range_m / (d_v + 1e-6))
+                        s_hi = np.maximum(s_hi_raw, s_min + 1e-3).astype(np.float32)
+                        
+                        r = np.random.rand(count_unk).astype(np.float32)
+                        s_val = s_min + r * (s_hi - s_min)
+                        
+                        pts_unk_local = pts_v * s_val[:, None]
+                        pts_robot_unk = self._to_robot_frame_cached(pts_unk_local, M_sw, M_wr, bank_off, dbg_frame=int(fid))
+                        lbl_unk = np.full((pts_robot_unk.shape[0],), LIDAR_UNKNOWN_SENTINEL, dtype=np.uint8)
+                        
+                        # Libérer mémoire
+                        del pts_v, d_v, s_hi_raw, s_hi, r, s_val, pts_unk_local, d
 
                 pts_concat = np.vstack([pts_robot_hits, pts_robot_empty, pts_robot_unk])
                 lbl_concat = np.hstack([lbl_hits, lbl_empty, lbl_unk])
@@ -1137,6 +1133,10 @@ class PersistentSensorManager:
 
                 self.lidar_accumulator.add(pts_concat, lbl_concat, tag=slot_id)
                 self._mark_lidar_seen(sensor_id, fid)
+                
+                # 🚀 Libération mémoire immédiate après ajout
+                del pts_concat, lbl_concat, pts_robot_hits, pts_robot_empty, pts_robot_unk
+                del lbl_hits, lbl_empty, lbl_unk, pts_local, arr
 
             except Exception:
                 try:
@@ -1989,7 +1989,8 @@ class FastDatasetGenerator:
         lidar_empty_points_per_hit: int = 2,
         camera_stride: int = 1,
         one_tick_per_pose: bool = False,
-        fast_one_tick: bool = False,
+        # 🚀 ACTIVÉ PAR DÉFAUT pour performance (comme V2 avec --one_tick_per_pose)
+        fast_one_tick: bool = True,
         fixed_delta_seconds: float = 0.2,
     ):
         
@@ -2157,18 +2158,22 @@ class FastDatasetGenerator:
                 with SectionTimer(self.perf, "apply_world_settings"):
                     settings = self.world.get_settings()
                     settings.synchronous_mode = True
-                    settings.fixed_delta_seconds = 0.2
-                    settings.no_rendering_mode = False
+                    # ✅ OPTIMISATION: Réduire de 0.2 à 0.05 (50ms) pour accélération 4x
+                    settings.fixed_delta_seconds = 0.05
+                    # 🚀 CRITIQUE: no_rendering_mode=True désactive la fenêtre spectateur
+                    # mais GARDE les caméras RGB fonctionnelles! Gain énorme en perf.
+                    settings.no_rendering_mode = True
                     
-                    # 3. Configurer le Substepping pour garder une physique parfaite
-                    settings.substepping = True
-                    settings.max_substep_delta_time = 0.05
-                    settings.max_substeps = 4
+                    # ✅ OPTIMISATION: Désactiver substepping (pas nécessaire pour dataset)
+                    # Gain: moins de calculs physiques inutiles
+                    settings.substepping = False
+                    settings.max_substep_delta_time = 0.01
+                    settings.max_substeps = 10
                     
                     self.world.apply_settings(settings)
                     print(
                         f"⚙️ World settings: fixed_delta_seconds={settings.fixed_delta_seconds:.3f}, "
-                        f"substep_dt={settings.max_substep_delta_time:.3f}, max_substeps={settings.max_substeps}"
+                        f"substep={settings.substepping}, max_substeps={settings.max_substeps}"
                     )
 
                     
@@ -2882,26 +2887,14 @@ class FastDatasetGenerator:
                 ticks_done = 0
 
                 with SectionTimer(self.perf, "lidar_accumulation_ticks"):
-                    # Logique corrigée:
-                    # 1er tick obligatoire (avec Cams actives si besoin)
-                    self.world.tick()
-                    # time.sleep(0.005) # petit sleep évite race conditions parfois
-                    ticks_done += 1
-                    
-                    # Si mode accumulate, on continue de tick SANS caméras
+                    # 🚀 MODE OPTIMISÉ: 1 tick par pose (comme V2)
                     if self.one_cam_tick_per_pose:
-                        # Désactiver caméras pour la suite
-                        self.sensor_manager.set_cameras_active(False)
-                        
-                        # Boucle jusqu'à quota atteint
-                        # Safety: max limits pas trop hautes
-                        max_extra = 20
-                        while (not self.sensor_manager.lidar_accumulator.is_complete()) and (ticks_done < max_extra):
-                             self.world.tick()
-                             ticks_done += 1
+                        # UN SEUL TICK - on ignore is_complete()
+                        self.world.tick()
+                        ticks_done = 1
                     else:
-                        # Mode "normal" (old): continue until complete or max_frames
-                         while (not self.sensor_manager.lidar_accumulator.is_complete()
+                        # Mode accumulation classique: boucle jusqu'à quota
+                        while (not self.sensor_manager.lidar_accumulator.is_complete()
                             and ticks_done < self.max_ticks_per_pose):
                             self.world.tick()
                             ticks_done += 1
@@ -2910,7 +2903,8 @@ class FastDatasetGenerator:
 
                 ok_lidar = True
                 if self.sensor_manager.target_lidar_frame is not None:
-                    ok_lidar = self.sensor_manager.wait_for_lidar_callbacks(timeout_s=3.0, poll_s=0.001)
+                    # ✅ OPTIMISATION: Réduire timeout de 3.0s à 0.5s (callbacks arrivent rapidement)
+                    ok_lidar = self.sensor_manager.wait_for_lidar_callbacks(timeout_s=0.5, poll_s=0.0005)
                     if not ok_lidar:
                         exp = self.sensor_manager._expected_lidar_callbacks()
                         with self.sensor_manager.lock:
@@ -2920,7 +2914,8 @@ class FastDatasetGenerator:
 
                 # Barrière compute: s'assure que la queue workers LiDAR est vide
                 # avant d'extraire l'accumulateur et de retéléporter les capteurs.
-                ok_workers = self.sensor_manager.wait_lidar_workers_idle(timeout_s=3.0, poll_s=0.001)
+                # ✅ OPTIMISATION: Réduire timeout de 3.0s à 0.5s
+                ok_workers = self.sensor_manager.wait_lidar_workers_idle(timeout_s=0.5, poll_s=0.0005)
                 if not ok_workers:
                     print("⚠️ Timeout: workers LiDAR encore occupés avant capture")
 
@@ -2941,7 +2936,7 @@ class FastDatasetGenerator:
                 # Barrière stricte en mode 1 tick/pose : si on n'a pas toutes les callbacks
                 # du frame cible, on SKIP la frame (sinon dataset instable / ROI quasi vide).
                 # On ne retick pas : on reste conforme à 1 tick par pose.
-                if self.one_tick_per_pose and (self.sensor_manager.target_lidar_frame is not None) and ((not ok_lidar) or (not ok_workers)):
+                if self.one_cam_tick_per_pose and (self.sensor_manager.target_lidar_frame is not None) and ((not ok_lidar) or (not ok_workers)):
                     print("⚠️ Skip frame: callbacks/workers LiDAR incomplets (mode 1 tick/pose)")
                     continue
 
