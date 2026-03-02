@@ -1,0 +1,6 @@
+Pour faire le record path dans le dossier trajectory
+    python RecordPath.py --maps Town10HD_Opt=15000 --sample-period=0.5
+
+
+
+python TransformData.py --inputs Dataset/carla_occ3d_datasete/Town2_mod0 Dataset/carla_occ3d_datasete/Town7_mod0 Dataset/carla_occ3d_datasete/Town5_mod0 Dataset/carla_occ3d_datasete/Town3_mod0 Dataset/carla_occ3d_datasete/Town10_mod0 + Dataset/carla_occ3d_datasete/Town10_mod2  --output Dataset/carla_occ3d_datasete/finalDataset
